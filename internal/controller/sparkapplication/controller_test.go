@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +40,17 @@ import (
 	"github.com/kubeflow/spark-operator/v2/pkg/common"
 	"github.com/kubeflow/spark-operator/v2/pkg/util"
 )
+
+// recordingSubmitter records the SparkApplication handed to Submit instead of
+// invoking spark-submit, so tests can assert on what the reconciler submits.
+type recordingSubmitter struct {
+	submitted *v1beta2.SparkApplication
+}
+
+func (s *recordingSubmitter) Submit(_ context.Context, app *v1beta2.SparkApplication) error {
+	s.submitted = app
+	return nil
+}
 
 var _ = Describe("SparkApplication Controller", func() {
 	Context("When reconciling a submitted SparkApplication", func() {
@@ -56,7 +67,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				Namespace: appNamespace,
 			},
 			Spec: v1beta2.SparkApplicationSpec{
-				MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+				MainApplicationFile: ptr.To("local:///dummy.jar"),
 			},
 		}
 		ingressKey := types.NamespacedName{
@@ -104,7 +115,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				nil,
 				k8sClient.Scheme(),
 				k8sClient,
-				record.NewFakeRecorder(3),
+				events.NewFakeRecorder(3),
 				nil,
 				&sparkapplication.SparkSubmitter{},
 				sparkapplication.Options{EnableUIService: true, IngressURLFormat: "{{$appName}}.spark.test.com", Namespaces: []string{appNamespace}},
@@ -138,7 +149,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				nil,
 				k8sClient.Scheme(),
 				k8sClient,
-				record.NewFakeRecorder(3),
+				events.NewFakeRecorder(3),
 				nil,
 				&sparkapplication.SparkSubmitter{},
 				sparkapplication.Options{EnableUIService: true, IngressURLFormat: "{{$appName}}.spark.test.com", IngressTLS: defaultIngressTLS, IngressAnnotations: defaultIngressAnnotations, Namespaces: []string{appNamespace}},
@@ -150,6 +161,99 @@ var _ = Describe("SparkApplication Controller", func() {
 			Expect(k8sClient.Get(ctx, ingressKey, ingress)).To(Succeed())
 			Expect(ingress.Spec.TLS).To(Equal(defaultIngressTLS))
 			Expect(ingress.ObjectMeta.Annotations).To(Equal(defaultIngressAnnotations))
+		})
+	})
+
+	Context("When reconciling a SparkApplication managed by an external controller", func() {
+		ctx := context.Background()
+		appName := "test-managedby"
+		appNamespace := "default"
+		key := types.NamespacedName{
+			Name:      appName,
+			Namespace: appNamespace,
+		}
+
+		BeforeEach(func() {
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      appName,
+					Namespace: appNamespace,
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					MainApplicationFile: ptr.To("local:///dummy.jar"),
+					ManagedBy:           ptr.To("kueue.x-k8s.io/multikueue"),
+				},
+			}
+			v1beta2.SetSparkApplicationDefaults(app)
+			Expect(k8sClient.Create(ctx, app)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			app := &v1beta2.SparkApplication{}
+			if err := k8sClient.Get(ctx, key, app); err == nil {
+				Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+			}
+		})
+
+		It("Should skip reconciliation without mutating status or creating child resources", func() {
+			By("Reconciling the externally-managed SparkApplication")
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{
+					EnableUIService:  true,
+					IngressURLFormat: "{{$appName}}.spark.test.com",
+					Namespaces:       []string{appNamespace},
+				},
+			)
+
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			By("Checking that no status mutation occurred")
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(app.Status.AppState.State).To(Or(BeEmpty(), Equal(v1beta2.ApplicationStateNew)))
+			Expect(app.Status.DriverInfo.PodName).To(BeEmpty())
+			Expect(app.Status.DriverInfo.WebUIServiceName).To(BeEmpty())
+			Expect(app.Status.DriverInfo.WebUIIngressName).To(BeEmpty())
+
+			By("Checking that no driver pod was created")
+			driverPod := &corev1.Pod{}
+			driverKey := getDriverNamespacedName(appName, appNamespace)
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, driverKey, driverPod))).To(BeTrue())
+		})
+
+		It("Should not delete pre-existing pods owned by the external controller", func() {
+			By("Creating a driver pod as if an external controller did")
+			externalDriver := createDriverPod(appName, appNamespace)
+			Expect(k8sClient.Create(ctx, externalDriver)).To(Succeed())
+			defer func() {
+				_ = client.IgnoreNotFound(k8sClient.Delete(ctx, externalDriver))
+			}()
+
+			By("Reconciling the externally-managed SparkApplication")
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			By("Checking that the external driver pod still exists")
+			stillAlive := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(externalDriver), stillAlive)).To(Succeed())
 		})
 	})
 
@@ -174,7 +278,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				Namespace: appNamespace,
 			},
 			Spec: v1beta2.SparkApplicationSpec{
-				MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+				MainApplicationFile: ptr.To("local:///dummy.jar"),
 				SparkUIOptions: &v1beta2.SparkUIConfiguration{
 					IngressTLS:         ingressTLS,
 					IngressAnnotations: ingressAnnotations,
@@ -227,7 +331,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				nil,
 				k8sClient.Scheme(),
 				k8sClient,
-				record.NewFakeRecorder(3),
+				events.NewFakeRecorder(3),
 				nil,
 				&sparkapplication.SparkSubmitter{},
 				sparkapplication.Options{EnableUIService: true, IngressURLFormat: "{{$appName}}.spark.test.com", Namespaces: []string{appNamespace}},
@@ -256,7 +360,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				nil,
 				k8sClient.Scheme(),
 				k8sClient,
-				record.NewFakeRecorder(3),
+				events.NewFakeRecorder(3),
 				nil,
 				&sparkapplication.SparkSubmitter{},
 				sparkapplication.Options{EnableUIService: true, IngressURLFormat: "{{$appName}}.spark.test.com", IngressTLS: defaultIngressTLS, IngressAnnotations: defaultIngressAnnotations, Namespaces: []string{appNamespace}},
@@ -290,7 +394,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						Namespace: appNamespace,
 					},
 					Spec: v1beta2.SparkApplicationSpec{
-						MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
 					},
 				}
 				v1beta2.SetSparkApplicationDefaults(app)
@@ -335,7 +439,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				nil,
 				k8sClient.Scheme(),
 				k8sClient,
-				nil,
+				events.NewFakeRecorder(3),
 				nil,
 				&sparkapplication.SparkSubmitter{},
 				sparkapplication.Options{Namespaces: []string{appNamespace}, DriverPodCreationGracePeriod: 0 * time.Second},
@@ -369,7 +473,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						Namespace: appNamespace,
 					},
 					Spec: v1beta2.SparkApplicationSpec{
-						MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
 					},
 				}
 				v1beta2.SetSparkApplicationDefaults(app)
@@ -417,6 +521,117 @@ var _ = Describe("SparkApplication Controller", func() {
 		})
 	})
 
+	Context("When reconciling a new SparkApplication with a default service account", func() {
+		ctx := context.Background()
+		appName := "test"
+		appNamespace := "default"
+		key := types.NamespacedName{
+			Name:      appName,
+			Namespace: appNamespace,
+		}
+
+		BeforeEach(func() {
+			By("Creating a test SparkApplication")
+			app := &v1beta2.SparkApplication{}
+			if err := k8sClient.Get(ctx, key, app); err != nil && errors.IsNotFound(err) {
+				app = &v1beta2.SparkApplication{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      appName,
+						Namespace: appNamespace,
+					},
+					Spec: v1beta2.SparkApplicationSpec{
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
+					},
+				}
+				v1beta2.SetSparkApplicationDefaults(app)
+				Expect(k8sClient.Create(ctx, app)).To(Succeed())
+
+				app.Status.AppState.State = v1beta2.ApplicationStateNew
+				Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
+			}
+		})
+
+		AfterEach(func() {
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+
+			By("Deleting the created test SparkApplication")
+			Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+		})
+
+		It("Should submit with the default service account without mutating the SparkApplication", func() {
+			By("Reconciling the created test SparkApplication")
+			submitter := &recordingSubmitter{}
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				submitter,
+				sparkapplication.Options{Namespaces: []string{appNamespace}, DefaultServiceAccount: "spark-operator-spark"},
+			)
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(submitter.submitted).NotTo(BeNil())
+			Expect(submitter.submitted.Spec.Driver.ServiceAccount).To(HaveValue(Equal("spark-operator-spark")))
+
+			By("Checking the fallback is not written back to the SparkApplication")
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			Expect(app.Spec.Driver.ServiceAccount).To(BeNil())
+		})
+
+		It("Should not set a driver service account when no default is configured", func() {
+			By("Reconciling the created test SparkApplication")
+			submitter := &recordingSubmitter{}
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				submitter,
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(submitter.submitted).NotTo(BeNil())
+			Expect(submitter.submitted.Spec.Driver.ServiceAccount).To(BeNil())
+		})
+
+		It("Should not apply the default service account when the driver pod template specifies one", func() {
+			By("Setting a service account in the driver pod template")
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			app.Spec.Driver.Template = &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "template-service-account",
+				},
+			}
+			Expect(k8sClient.Update(ctx, app)).To(Succeed())
+
+			By("Reconciling the created test SparkApplication")
+			submitter := &recordingSubmitter{}
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				submitter,
+				sparkapplication.Options{Namespaces: []string{appNamespace}, DefaultServiceAccount: "spark-operator-spark"},
+			)
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(submitter.submitted).NotTo(BeNil())
+			Expect(submitter.submitted.Spec.Driver.ServiceAccount).To(BeNil())
+			Expect(submitter.submitted.Spec.Driver.Template.Spec.ServiceAccountName).To(Equal("template-service-account"))
+		})
+	})
+
 	Context("When reconciling a completed SparkApplication", func() {
 		ctx := context.Background()
 		appName := "test"
@@ -439,7 +654,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						},
 					},
 					Spec: v1beta2.SparkApplicationSpec{
-						MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
 					},
 				}
 				v1beta2.SetSparkApplicationDefaults(app)
@@ -494,7 +709,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						Namespace: appNamespace,
 					},
 					Spec: v1beta2.SparkApplicationSpec{
-						MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
 					},
 				}
 				v1beta2.SetSparkApplicationDefaults(app)
@@ -514,7 +729,7 @@ var _ = Describe("SparkApplication Controller", func() {
 			By("Set TimeToLiveSeconds and make the SparkApplication expired")
 			app := &v1beta2.SparkApplication{}
 			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
-			app.Spec.TimeToLiveSeconds = util.Int64Ptr(60)
+			app.Spec.TimeToLiveSeconds = ptr.To[int64](60)
 			Expect(k8sClient.Update(ctx, app)).To(Succeed())
 			app.Status.TerminationTime = metav1.NewTime(time.Now().Add(-2 * time.Minute))
 			Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
@@ -532,6 +747,181 @@ var _ = Describe("SparkApplication Controller", func() {
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.Requeue).To(BeFalse())
+		})
+	})
+
+	Context("When reconciling a terminated SparkApplication with the operator default TTL", func() {
+		ctx := context.Background()
+		appName := "test-default-ttl"
+		appNamespace := "default"
+		key := types.NamespacedName{Name: appName, Namespace: appNamespace}
+
+		BeforeEach(func() {
+			// Create the SparkApplication if it does not already exist.
+			app := &v1beta2.SparkApplication{}
+			err := k8sClient.Get(ctx, key, app)
+			if errors.IsNotFound(err) {
+				app = &v1beta2.SparkApplication{
+					ObjectMeta: metav1.ObjectMeta{Name: appName, Namespace: appNamespace},
+					Spec: v1beta2.SparkApplicationSpec{
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
+					},
+				}
+				v1beta2.SetSparkApplicationDefaults(app)
+				Expect(k8sClient.Create(ctx, app)).To(Succeed())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			// Unconditionally drive the app into a terminated state whose TTL has already
+			// elapsed, so the precondition holds regardless of any pre-existing object.
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			app.Status.AppState.State = v1beta2.ApplicationStateCompleted
+			app.Status.TerminationTime = metav1.NewTime(time.Now().Add(-2 * time.Minute))
+			Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			app := &v1beta2.SparkApplication{}
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, key, app))).To(BeTrue())
+		})
+
+		It("Should delete a terminated app past the operator default TTL when it has no spec TTL", func() {
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				nil,
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{Namespaces: []string{appNamespace}, DefaultTimeToLiveSeconds: 60},
+			)
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.Requeue).To(BeFalse())
+		})
+	})
+
+	Context("When reconciling a terminated SparkApplication that has not yet outlived the operator default TTL", func() {
+		ctx := context.Background()
+		appName := "test-default-ttl-not-expired"
+		appNamespace := "default"
+		key := types.NamespacedName{Name: appName, Namespace: appNamespace}
+
+		BeforeEach(func() {
+			// Create the SparkApplication if it does not already exist.
+			app := &v1beta2.SparkApplication{}
+			err := k8sClient.Get(ctx, key, app)
+			if errors.IsNotFound(err) {
+				app = &v1beta2.SparkApplication{
+					ObjectMeta: metav1.ObjectMeta{Name: appName, Namespace: appNamespace},
+					Spec: v1beta2.SparkApplicationSpec{
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
+					},
+				}
+				v1beta2.SetSparkApplicationDefaults(app)
+				Expect(k8sClient.Create(ctx, app)).To(Succeed())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			// Terminate the app only 30s ago so it has not yet outlived a 60s default TTL.
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			app.Status.AppState.State = v1beta2.ApplicationStateCompleted
+			app.Status.TerminationTime = metav1.NewTime(time.Now().Add(-30 * time.Second))
+			Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			app := &v1beta2.SparkApplication{}
+			if err := k8sClient.Get(ctx, key, app); err == nil {
+				Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+			}
+		})
+
+		It("Should not delete the app and should requeue it for later deletion using the effective TTL", func() {
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				nil,
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{Namespaces: []string{appNamespace}, DefaultTimeToLiveSeconds: 60},
+			)
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			// The app has not yet expired, so it must be requeued (not deleted immediately)
+			// after roughly the remaining TTL (60s TTL - ~30s survived).
+			Expect(result.Requeue).To(BeFalse())
+			Expect(result.RequeueAfter).To(BeNumerically(">", time.Duration(0)))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", 30*time.Second))
+
+			// The app must still exist.
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+		})
+	})
+
+	Context("When reconciling a terminated SparkApplication with the operator default TTL disabled by a zero value", func() {
+		ctx := context.Background()
+		appName := "test-default-ttl-zero"
+		appNamespace := "default"
+		key := types.NamespacedName{Name: appName, Namespace: appNamespace}
+
+		BeforeEach(func() {
+			// Create the SparkApplication if it does not already exist.
+			app := &v1beta2.SparkApplication{}
+			err := k8sClient.Get(ctx, key, app)
+			if errors.IsNotFound(err) {
+				app = &v1beta2.SparkApplication{
+					ObjectMeta: metav1.ObjectMeta{Name: appName, Namespace: appNamespace},
+					Spec: v1beta2.SparkApplicationSpec{
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
+					},
+				}
+				v1beta2.SetSparkApplicationDefaults(app)
+				Expect(k8sClient.Create(ctx, app)).To(Succeed())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			// Terminate the app well in the past; a zero default TTL must still leave it alone.
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+			app.Status.AppState.State = v1beta2.ApplicationStateCompleted
+			app.Status.TerminationTime = metav1.NewTime(time.Now().Add(-2 * time.Minute))
+			Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			app := &v1beta2.SparkApplication{}
+			if err := k8sClient.Get(ctx, key, app); err == nil {
+				Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+			}
+		})
+
+		It("Should not delete or requeue the app when the normalized default TTL is zero", func() {
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				nil,
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{Namespaces: []string{appNamespace}, DefaultTimeToLiveSeconds: 0},
+			)
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			// A zero default TTL disables the feature: no default is applied, so the app is
+			// neither deleted nor requeued for later deletion.
+			Expect(result.Requeue).To(BeFalse())
+			Expect(result.RequeueAfter).To(Equal(time.Duration(0)))
+
+			// The app must still exist.
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
 		})
 	})
 
@@ -554,7 +944,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						Namespace: appNamespace,
 					},
 					Spec: v1beta2.SparkApplicationSpec{
-						MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
 					},
 				}
 				v1beta2.SetSparkApplicationDefaults(app)
@@ -609,7 +999,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						Namespace: appNamespace,
 					},
 					Spec: v1beta2.SparkApplicationSpec{
-						MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
 					},
 				}
 				v1beta2.SetSparkApplicationDefaults(app)
@@ -629,7 +1019,7 @@ var _ = Describe("SparkApplication Controller", func() {
 			By("Set TimeToLiveSeconds and make the SparkApplication expired")
 			app := &v1beta2.SparkApplication{}
 			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
-			app.Spec.TimeToLiveSeconds = util.Int64Ptr(60)
+			app.Spec.TimeToLiveSeconds = ptr.To[int64](60)
 			Expect(k8sClient.Update(ctx, app)).To(Succeed())
 			app.Status.TerminationTime = metav1.NewTime(time.Now().Add(-2 * time.Minute))
 			Expect(k8sClient.Status().Update(ctx, app)).To(Succeed())
@@ -669,7 +1059,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						Namespace: appNamespace,
 					},
 					Spec: v1beta2.SparkApplicationSpec{
-						MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+						MainApplicationFile: ptr.To("local:///dummy.jar"),
 					},
 				}
 				v1beta2.SetSparkApplicationDefaults(app)
@@ -722,7 +1112,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				nil,
 				k8sClient.Scheme(),
 				k8sClient,
-				record.NewFakeRecorder(3),
+				events.NewFakeRecorder(3),
 				nil,
 				&sparkapplication.SparkSubmitter{},
 				sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
@@ -742,7 +1132,7 @@ var _ = Describe("SparkApplication Controller", func() {
 				nil,
 				k8sClient.Scheme(),
 				k8sClient,
-				record.NewFakeRecorder(3),
+				events.NewFakeRecorder(3),
 				nil,
 				&sparkapplication.SparkSubmitter{},
 				sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 1},
@@ -754,6 +1144,279 @@ var _ = Describe("SparkApplication Controller", func() {
 			app := &v1beta2.SparkApplication{}
 			Expect(k8sClient.Get(ctx, key, app)).NotTo(HaveOccurred())
 			Expect(app.Status.ExecutorState).To(HaveLen(1))
+		})
+	})
+
+	Context("When reconciling a succeeding SparkApplication with Always retry policy", func() {
+		ctx := context.Background()
+		appName := "test"
+		appNamespace := "default"
+		key := types.NamespacedName{
+			Name:      appName,
+			Namespace: appNamespace,
+		}
+
+		BeforeEach(func() {
+			By("Creating a SparkApplication with Always restart policy")
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      appName,
+					Namespace: appNamespace,
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					MainApplicationFile: ptr.To("local:///dummy.jar"),
+					RestartPolicy: v1beta2.RestartPolicy{
+						Type: v1beta2.RestartPolicyAlways,
+					},
+				},
+			}
+			v1beta2.SetSparkApplicationDefaults(app)
+			Expect(k8sClient.Create(ctx, app)).Should(Succeed())
+
+			By("Creating a driver pod with Succeeded phase")
+			driver := createDriverPod(appName, appNamespace)
+			Expect(k8sClient.Create(ctx, driver)).Should(Succeed())
+			driver.Status.Phase = corev1.PodSucceeded
+			Expect(k8sClient.Status().Update(ctx, driver)).Should(Succeed())
+
+			By("Creating a executor pod with Succeeded phase")
+			executor := createExecutorPod(appName, appNamespace, 1)
+			Expect(k8sClient.Create(ctx, executor)).To(Succeed())
+			executor.Status.Phase = corev1.PodSucceeded
+			Expect(k8sClient.Status().Update(ctx, executor)).To(Succeed())
+
+			By("Updating the SparkApplication state to Succeeding")
+			now := time.Now()
+			app.Status.SparkApplicationID = "test-app-id"
+			app.Status.SubmissionAttempts = 1
+			app.Status.LastSubmissionAttemptTime = metav1.NewTime(now.Add(-5 * time.Minute))
+			app.Status.ExecutionAttempts = 1
+			app.Status.TerminationTime = metav1.NewTime(now.Add(-30 * time.Second))
+			app.Status.AppState.State = v1beta2.ApplicationStateSucceeding
+			app.Status.DriverInfo.PodName = driver.Name
+			app.Status.ExecutorState = map[string]v1beta2.ExecutorState{
+				executor.Name: util.GetExecutorState(executor),
+			}
+			Expect(k8sClient.Status().Update(ctx, app)).Should(Succeed())
+		})
+
+		AfterEach(func() {
+			By("Deleting the test SparkApplication")
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      appName,
+					Namespace: appNamespace,
+				},
+			}
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, app))).Should(Succeed())
+
+			By("Deleting the driver pod")
+			driverKey := getDriverNamespacedName(appName, appNamespace)
+			driver := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      driverKey.Name,
+					Namespace: driverKey.Namespace,
+				},
+			}
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, driver))).Should(Succeed())
+
+			By("Deleting the executor pods")
+			executorKey := getExecutorNamespacedName(appName, appNamespace, 1)
+			executor := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      executorKey.Name,
+					Namespace: executorKey.Namespace,
+				},
+			}
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, executor))).Should(Succeed())
+		})
+
+		It("Should reset SparkApplication status when transitioning to PendingRerun", func() {
+			By("Reconciling the failing SparkApplication")
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking whether the SparkApplication status has been reset")
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).NotTo(HaveOccurred())
+			Expect(app.Status.SparkApplicationID).To(BeEmpty())
+			Expect(app.Status.TerminationTime).To(BeZero())
+			Expect(app.Status.AppState.State).To(Equal(v1beta2.ApplicationStatePendingRerun))
+			Expect(app.Status.AppState.ErrorMessage).To(BeEmpty())
+			Expect(app.Status.DriverInfo).To(BeZero())
+			Expect(app.Status.ExecutorState).To(BeEmpty())
+		})
+
+		It("Should delete existing driver and executor pods when transitioning to PendingRerun", func() {
+			By("Reconciling the failing SparkApplication")
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking whether the driver pod has been deleted")
+			driverKey := getDriverNamespacedName(appName, appNamespace)
+			driverPod := &corev1.Pod{}
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, driverKey, driverPod))).To(BeTrue())
+
+			By("Checking whether the executor pods has been deleted")
+			executorKey := getDriverNamespacedName(appName, appNamespace)
+			executorPod := &corev1.Pod{}
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, executorKey, executorPod))).To(BeTrue())
+		})
+	})
+
+	Context("When reconciling a failing SparkApplication which should retry", func() {
+		ctx := context.Background()
+		appName := "test"
+		appNamespace := "default"
+		key := types.NamespacedName{
+			Name:      appName,
+			Namespace: appNamespace,
+		}
+
+		BeforeEach(func() {
+			By("Creating a SparkApplication with OnFailure restart policy")
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      appName,
+					Namespace: appNamespace,
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					MainApplicationFile: ptr.To("local:///dummy.jar"),
+					RestartPolicy: v1beta2.RestartPolicy{
+						Type:                   v1beta2.RestartPolicyOnFailure,
+						OnFailureRetries:       ptr.To[int32](3),
+						OnFailureRetryInterval: ptr.To[int64](10),
+					},
+				},
+			}
+			v1beta2.SetSparkApplicationDefaults(app)
+			Expect(k8sClient.Create(ctx, app)).Should(Succeed())
+
+			By("Creating a driver pod with Failed phase")
+			driver := createDriverPod(appName, appNamespace)
+			Expect(k8sClient.Create(ctx, driver)).Should(Succeed())
+			driver.Status.Phase = corev1.PodFailed
+			Expect(k8sClient.Status().Update(ctx, driver)).Should(Succeed())
+
+			By("Creating a executor pod with Failed phase")
+			executor := createExecutorPod(appName, appNamespace, 1)
+			Expect(k8sClient.Create(ctx, executor)).To(Succeed())
+			executor.Status.Phase = corev1.PodFailed
+			Expect(k8sClient.Status().Update(ctx, executor)).To(Succeed())
+
+			By("Updating the SparkApplication state to Failing")
+			now := time.Now()
+			app.Status.SparkApplicationID = "test-app-id"
+			app.Status.SubmissionAttempts = 1
+			app.Status.LastSubmissionAttemptTime = metav1.NewTime(now.Add(-5 * time.Minute))
+			app.Status.ExecutionAttempts = 1
+			app.Status.TerminationTime = metav1.NewTime(now.Add(-30 * time.Second))
+			app.Status.AppState.State = v1beta2.ApplicationStateFailing
+			app.Status.AppState.ErrorMessage = "Driver pod failed"
+			app.Status.DriverInfo.PodName = driver.Name
+			app.Status.ExecutorState = map[string]v1beta2.ExecutorState{
+				executor.Name: util.GetExecutorState(executor),
+			}
+			Expect(k8sClient.Status().Update(ctx, app)).Should(Succeed())
+		})
+
+		AfterEach(func() {
+			By("Deleting the test SparkApplication")
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      appName,
+					Namespace: appNamespace,
+				},
+			}
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, app))).Should(Succeed())
+
+			By("Deleting the driver pod")
+			driverKey := getDriverNamespacedName(appName, appNamespace)
+			driver := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      driverKey.Name,
+					Namespace: driverKey.Namespace,
+				},
+			}
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, driver))).Should(Succeed())
+
+			By("Deleting the executor pods")
+			executorKey := getExecutorNamespacedName(appName, appNamespace, 1)
+			executor := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      executorKey.Name,
+					Namespace: executorKey.Namespace,
+				},
+			}
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, executor))).Should(Succeed())
+		})
+
+		It("Should reset SparkApplication status when transitioning to PendingRerun", func() {
+			By("Reconciling the failing SparkApplication")
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking whether the SparkApplication status has been reset")
+			app := &v1beta2.SparkApplication{}
+			Expect(k8sClient.Get(ctx, key, app)).NotTo(HaveOccurred())
+			Expect(app.Status.SparkApplicationID).To(BeEmpty())
+			Expect(app.Status.TerminationTime).To(BeZero())
+			Expect(app.Status.AppState.State).To(Equal(v1beta2.ApplicationStatePendingRerun))
+			Expect(app.Status.AppState.ErrorMessage).To(BeEmpty())
+			Expect(app.Status.DriverInfo).To(BeZero())
+			Expect(app.Status.ExecutorState).To(BeEmpty())
+		})
+
+		It("Should delete existing driver and executor pods when transitioning to PendingRerun", func() {
+			By("Reconciling the failing SparkApplication")
+			reconciler := sparkapplication.NewReconciler(
+				nil,
+				k8sClient.Scheme(),
+				k8sClient,
+				events.NewFakeRecorder(3),
+				nil,
+				&sparkapplication.SparkSubmitter{},
+				sparkapplication.Options{Namespaces: []string{appNamespace}},
+			)
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Checking whether the driver pod has been deleted")
+			driverKey := getDriverNamespacedName(appName, appNamespace)
+			driverPod := &corev1.Pod{}
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, driverKey, driverPod))).To(BeTrue())
+
+			By("Checking whether the executor pods has been deleted")
+			executorKey := getDriverNamespacedName(appName, appNamespace)
+			executorPod := &corev1.Pod{}
+			Expect(errors.IsNotFound(k8sClient.Get(ctx, executorKey, executorPod))).To(BeTrue())
 		})
 	})
 
@@ -774,7 +1437,7 @@ var _ = Describe("SparkApplication Controller", func() {
 					Namespace: appNamespace,
 				},
 				Spec: v1beta2.SparkApplicationSpec{
-					MainApplicationFile: util.StringPtr("local:///dummy.jar"),
+					MainApplicationFile: ptr.To("local:///dummy.jar"),
 				},
 			}
 			v1beta2.SetSparkApplicationDefaults(app)
@@ -799,7 +1462,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						nil,
 						k8sClient.Scheme(),
 						k8sClient,
-						record.NewFakeRecorder(3),
+						events.NewFakeRecorder(3),
 						nil,
 						&sparkapplication.SparkSubmitter{},
 						sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
@@ -865,7 +1528,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						nil,
 						k8sClient.Scheme(),
 						k8sClient,
-						record.NewFakeRecorder(3),
+						events.NewFakeRecorder(3),
 						nil,
 						&sparkapplication.SparkSubmitter{},
 						sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
@@ -899,7 +1562,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						nil,
 						k8sClient.Scheme(),
 						k8sClient,
-						record.NewFakeRecorder(3),
+						events.NewFakeRecorder(3),
 						nil,
 						&sparkapplication.SparkSubmitter{},
 						sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
@@ -933,7 +1596,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						nil,
 						k8sClient.Scheme(),
 						k8sClient,
-						record.NewFakeRecorder(3),
+						events.NewFakeRecorder(3),
 						nil,
 						&sparkapplication.SparkSubmitter{},
 						sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
@@ -977,7 +1640,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						nil,
 						k8sClient.Scheme(),
 						k8sClient,
-						record.NewFakeRecorder(3),
+						events.NewFakeRecorder(3),
 						nil,
 						&sparkapplication.SparkSubmitter{},
 						sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
@@ -1014,7 +1677,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						nil,
 						k8sClient.Scheme(),
 						k8sClient,
-						record.NewFakeRecorder(3),
+						events.NewFakeRecorder(3),
 						nil,
 						&sparkapplication.SparkSubmitter{},
 						sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},
@@ -1058,7 +1721,7 @@ var _ = Describe("SparkApplication Controller", func() {
 						nil,
 						k8sClient.Scheme(),
 						k8sClient,
-						record.NewFakeRecorder(3),
+						events.NewFakeRecorder(3),
 						nil,
 						&sparkapplication.SparkSubmitter{},
 						sparkapplication.Options{Namespaces: []string{appNamespace}, MaxTrackedExecutorPerApp: 10},

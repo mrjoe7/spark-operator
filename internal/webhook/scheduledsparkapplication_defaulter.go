@@ -19,31 +19,36 @@ package webhook
 import (
 	"context"
 
-	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
 )
 
-// +kubebuilder:webhook:admissionReviewVersions=v1,failurePolicy=fail,groups=sparkoperator.k8s.io,matchPolicy=Exact,mutating=false,name=mutate-scheduledsparkapplication.sparkoperator.k8s.io,path=/validate-sparkoperator-k8s-io-v1beta2-sparkapplication,reinvocationPolicy=Never,resources=scheduledsparkapplications,sideEffects=None,verbs=create;update,versions=v1beta2,webhookVersions=v1
+// +kubebuilder:webhook:admissionReviewVersions=v1,failurePolicy=fail,groups=sparkoperator.k8s.io,matchPolicy=Exact,mutating=true,name=mutate-scheduledsparkapplication.sparkoperator.k8s.io,path=/mutate-sparkoperator-k8s-io-v1beta2-scheduledsparkapplication,reinvocationPolicy=Never,resources=scheduledsparkapplications,sideEffects=None,verbs=create;update,versions=v1beta2,webhookVersions=v1
 
-// ScheduledSparkApplicationDefaulter sets default values for a SparkApplication.
+// ScheduledSparkApplicationDefaulter sets default values for a ScheduledSparkApplication.
 type ScheduledSparkApplicationDefaulter struct{}
 
-// NewSparkApplicationValidator creates a new SparkApplicationValidator instance.
+// NewScheduledSparkApplicationDefaulter creates a new ScheduledSparkApplicationDefaulter instance.
 func NewScheduledSparkApplicationDefaulter() *ScheduledSparkApplicationDefaulter {
 	return &ScheduledSparkApplicationDefaulter{}
 }
 
-// SparkApplicationDefaulter implements admission.CustomDefaulter.
-var _ admission.CustomDefaulter = &ScheduledSparkApplicationDefaulter{}
+// ScheduledSparkApplicationDefaulter implements admission.Defaulter.
+var _ admission.Defaulter[*v1beta2.ScheduledSparkApplication] = &ScheduledSparkApplicationDefaulter{}
 
-// Default implements admission.CustomDefaulter.
-func (d *ScheduledSparkApplicationDefaulter) Default(ctx context.Context, obj runtime.Object) error {
-	app, ok := obj.(*v1beta2.ScheduledSparkApplication)
-	if !ok {
+// Default implements admission.Defaulter.
+// This is currently a no-op placeholder. Concrete defaulting logic (e.g., calling
+// operatorscheme.WebhookScheme.Default) will be added in a future PR.
+// The webhook is registered now so that the manifest path is correct and
+// ready when defaulting is implemented.
+func (d *ScheduledSparkApplicationDefaulter) Default(ctx context.Context, obj *v1beta2.ScheduledSparkApplication) error {
+	if obj == nil {
 		return nil
 	}
-	logger.Info("Defaulting ScheduledSparkApplication", "name", app.Name, "namespace", app.Namespace)
+
+	logger := log.FromContext(ctx)
+	logger.Info("Mutating ScheduledSparkApplication")
 	return nil
 }

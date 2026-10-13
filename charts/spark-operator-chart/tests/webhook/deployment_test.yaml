@@ -100,6 +100,20 @@ tests:
           path: spec.template.metadata.annotations.key2
           value: value2
 
+  - it: Should add deployment annotations if `webhook.deploymentAnnotations` is set
+    set:
+      webhook:
+        deploymentAnnotations:
+          key1: value1
+          key2: value2
+    asserts:
+      - equal:
+          path: metadata.annotations.key1
+          value: value1
+      - equal:
+          path: metadata.annotations.key2
+          value: value2
+
   - it: Should use the specified image repository if `image.registry`, `image.repository` and `image.tag` are set
     set:
       image:
@@ -197,6 +211,25 @@ tests:
       - contains:
           path: spec.template.spec.containers[?(@.name=="spark-operator-webhook")].args
           content: --leader-election=false
+
+  - it: Should add leader election parameters if `webhook.leaderElection.leaseDuration`, `webhook.leaderElection.renewDeadline` and `webhook.leaderElection.retryPeriod` are set.
+    set:
+      webhook:
+        leaderElection:
+          enable: true
+          leaseDuration: 120s
+          renewDeadline: 30s
+          retryPeriod: 15s
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-webhook")].args
+          content: --leader-election-lease-duration=120s
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-webhook")].args
+          content: --leader-election-renew-deadline=30s
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-webhook")].args
+          content: --leader-election-retry-period=15s
 
   - it: Should add webhook port
     set:
@@ -579,3 +612,68 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "webhook.replicas must be greater than 1 to enable topology spread constraints for webhook pods"
+
+  - it: Should include hostUsers when kubernetes version >= 1.30 and hostUsers is true
+    capabilities:
+      majorVersion: 1
+      minorVersion: 30
+    set:
+      webhook:
+        hostUsers: true
+    asserts:
+      - equal:
+          path: spec.template.spec.hostUsers
+          value: true
+
+  - it: Should include hostUsers when kubernetes version >= 1.30 and hostUsers is false
+    capabilities:
+      majorVersion: 1
+      minorVersion: 34
+    set:
+      webhook:
+        hostUsers: false
+    asserts:
+      - equal:
+          path: spec.template.spec.hostUsers
+          value: false
+
+  - it: Should not contain hostUsers when kubernetes version < 1.29 and hostUsers is set
+    capabilities:
+      majorVersion: 1
+      minorVersion: 29
+    set:
+      webhook:
+        hostUsers: true
+    asserts:
+      - notExists:
+          path: spec.template.spec.hostUsers
+
+  - it: Should not include hostUsers when kubernetes version >= 1.30 but value not set
+    capabilities:
+      majorVersion: 1
+      minorVersion: 34
+    asserts:
+      - notExists:
+          path: spec.template.spec.hostUsers
+
+  - it: Should should NOT include hostUsers when kubernetes version >= 1.30 but value is string
+    capabilities:
+      majorVersion: 1
+      minorVersion: 34
+    set:
+      webhook:
+        hostUsers: "true"
+    asserts:
+      - notExists:
+          path: spec.template.spec.hostUsers
+
+  - it: Should not include hostUsers when kubernetes version >= 1.30 but value is null
+    capabilities:
+      majorVersion: 1
+      minorVersion: 34
+    set:
+      webhook:
+        hostUsers: null
+    asserts:
+      - notExists:
+          path: spec.template.spec.hostUsers

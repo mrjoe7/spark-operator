@@ -55,10 +55,48 @@ hook:
     # -- Image tag.
     # @default -- If not set, the chart appVersion will be used.
     tag: ""
+  # -- Pod resource requests and limits for the Helm hook Job container.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+  # -- Node selector for the Helm hook Job.
+  nodeSelector: {}
+
+  # -- Affinity for the Helm hook Job.
+  affinity: {}
+
+  # -- List of node taints to tolerate for the Helm hook Job.
+  tolerations: []
+
+  # -- Extra labels for the Helm hook Job pod.
+  labels: {}
+    # key1: value1
+    # key2: value2
+
+  # -- Extra annotations for the Helm hook Job pod.
+  annotations: {}
+    # key1: value1
+    # key2: value2
 
 controller:
   # -- Number of replicas of controller.
   replicas: 1
+
+  # -- Feature gates to enable or disable specific features.
+  featureGates:
+  - name: PartialRestart
+    enabled: false
+  - name: LoadSparkDefaults
+    enabled: false
+  - name: RestSubmitter
+    enabled: false
+  - name: DefaultTimeToLive
+    enabled: false
 
   # -- The number of old history to retain to allow rollback.
   revisionHistoryLimit: 10
@@ -87,6 +125,38 @@ controller:
 
   # -- Specifies the maximum number of Executor pods that can be tracked by the controller per SparkApplication.
   maxTrackedExecutorPerApp: 1000
+
+  # -- Default Time-To-Live (in seconds) applied to terminated SparkApplications that do not
+  # set spec.timeToLiveSeconds. Requires the DefaultTimeToLive feature gate to be enabled.
+  # 0 (default) disables it.
+  defaultTimeToLiveSeconds: 0
+
+  # -- Name of the service account used by the Spark driver pod and the Spark Connect server
+  # pod when neither the custom resource nor its pod template specifies one. Leave empty to
+  # disable the fallback, in which case the namespace's default service account is used. The
+  # service account must already exist in every namespace where Spark workloads are created;
+  # note that `spark.serviceAccount.create` only provisions accounts for the namespaces listed
+  # in `spark.jobNamespaces`.
+  defaultServiceAccount: ""
+
+  # -- Driver PDB feature gate. When true, the controller creates a PodDisruptionBudget for each SparkApplication that sets spec.driverPodDisruptionBudget=true. Default false.
+  driverPodDisruptionBudget:
+    enable: false
+
+  # -- Maximum QPS to the API server from the controller client.
+  kubeAPIQPS: 20
+  # -- Maximum burst for throttle from the controller client.
+  kubeAPIBurst: 30
+
+  # -- Timestamp precision for ScheduledSparkApplication run names.
+  # Valid values: nanos (default), micros, millis, seconds, minutes.
+  # Shorter precisions produce shorter names which helps with Kubernetes name length limits.
+  # NOTE: Using lower precisions such as "seconds" or "minutes" increases the risk of name
+  # collisions if multiple runs are created within the same time unit (for example during
+  # reconciliation loops or manual re-triggers). A collision will cause run creation to fail.
+  # Choose a precision compatible with your scheduling frequency: "minutes" is only suitable
+  # for jobs scheduled at most once per minute, "seconds" for jobs scheduled at most once per second.
+  scheduledSparkApplicationTimestampPrecision: nanos
 
   uiService:
     # -- Specifies whether to create service for Spark web UI.
@@ -149,6 +219,11 @@ controller:
     # key1: value1
     # key2: value2
 
+  # -- Annotations for the controller Deployment resource (metadata.annotations).
+  deploymentAnnotations: {}
+    # key1: value1
+    # key2: value2
+
   # -- Volumes for controller pods.
   volumes:
   # Create a tmp directory to write Spark artifacts to for deployed Spark apps.
@@ -182,6 +257,11 @@ controller:
   # - maxSkew: 1
   #   topologyKey: kubernetes.io/hostname
   #   whenUnsatisfiable: DoNotSchedule
+
+  # -- Whether to use user namespace or not
+  # Kubernetes version 1.30 for feature beta (1.33 for GA) or higher is required with support from OS and OCI runtime
+  # ref: https://kubernetes.io/docs/concepts/workloads/pods/user-namespaces/
+  hostUsers: null
 
   # -- Environment variables for controller containers.
   env: []
@@ -253,6 +333,34 @@ controller:
       # -- Specifies the maximum delay duration for the workqueue rate limiter.
       duration: 6h
 
+# REST Submitter Service configuration.
+# The submitter service itself is deployed separately (see submitter service repository).
+# These values configure the controller's connection to the submitter.
+# Enable via controller.featureGates RestSubmitter=true.
+submitter:
+  # -- URL of the REST submitter service endpoint.
+  serviceUrl: http://spark-operator-submitter-svc:8080/api/v1/spark-submit
+
+  # -- HTTP request timeout per spark submission attempt.
+  requestTimeout: 2m
+
+  # -- How long the controller waits for the submitter service to become reachable at startup.
+  startupTimeout: 5m
+
+  # -- Max retry attempts for transient submission failures.
+  maxRetries: 3
+
+  # -- Initial backoff duration before the first retry. Doubles on each subsequent attempt.
+  initialBackoff: 2s
+
+  # Controller startup probe settings. Allows the controller to block during startup
+  # without being killed by liveness probe. Should cover startupTimeout.
+  startupProbe:
+    # -- Seconds between probe attempts.
+    periodSeconds: 5
+    # -- Number of failures before restart. (failureThreshold × periodSeconds) should >= startupTimeout.
+    failureThreshold: 60
+
 webhook:
   # -- Specifies whether to enable webhook.
   enable: true
@@ -266,6 +374,12 @@ webhook:
   leaderElection:
     # -- Specifies whether to enable leader election for webhook.
     enable: true
+    # -- Leader election lease duration.
+    leaseDuration: 15s
+    # -- Leader election renew deadline.
+    renewDeadline: 10s
+    # -- Leader election retry period.
+    retryPeriod: 2s
 
   # -- Configure the verbosity of logging, can be one of `debug`, `info`, `error`.
   logLevel: info
@@ -285,6 +399,11 @@ webhook:
 
   # -- Specifies the timeout seconds of the webhook, the value must be between 1 and 30.
   timeoutSeconds: 10
+
+  # -- Maximum QPS to the API server from the controller client.
+  kubeAPIQPS: 20
+  # -- Maximum burst for throttle from the controller client.
+  kubeAPIBurst: 30
 
   resourceQuotaEnforcement:
     # -- Specifies whether to enable the ResourceQuota enforcement for SparkApplication resources.
@@ -313,6 +432,11 @@ webhook:
 
   # -- Extra annotations for webhook pods.
   annotations: {}
+    # key1: value1
+    # key2: value2
+
+  # -- Annotations for the webhook Deployment resource (metadata.annotations).
+  deploymentAnnotations: {}
     # key1: value1
     # key2: value2
 
@@ -352,6 +476,11 @@ webhook:
   # - maxSkew: 1
   #   topologyKey: kubernetes.io/hostname
   #   whenUnsatisfiable: DoNotSchedule
+
+  # -- Whether to use user namespace or not
+  # Kubernetes version 1.30 for feature beta (1.33 for GA) or higher is required with support from OS and OCI runtime
+  # ref: https://kubernetes.io/docs/concepts/workloads/pods/user-namespaces/
+  hostUsers: null
 
   # -- Environment variables for webhook containers.
   env: []
@@ -401,9 +530,17 @@ webhook:
 spark:
   # -- List of namespaces where to run spark jobs.
   # If empty string is included, all namespaces will be allowed.
+  # Namespaces specified here will be watched in addition to those matching jobNamespaceSelector.
   # Make sure the namespaces have already existed.
   jobNamespaces:
   - default
+
+  # -- Label selector to filter namespaces to watch.
+  # Supports standard Kubernetes label selector syntax (e.g., 'spark-operator=enabled,env in (prod,staging)').
+  # Namespaces matching this selector will be watched in addition to those in jobNamespaces.
+  # When specified, requires ClusterRole permission to list and watch namespaces.
+  # Leave empty to disable namespace selector functionality.
+  jobNamespaceSelector: ""
 
   serviceAccount:
     # -- Specifies whether to create a service account for spark applications.
@@ -433,8 +570,13 @@ prometheus:
     endpoint: /metrics
     # -- Metrics prefix, will be added to all exported metrics.
     prefix: ""
+    # -- Job Submit Latency histogram buckets. Specified in seconds.
+    jobSubmitLatencyBuckets: "0.5,1,2,4,8,16,32,64,128,256"
     # -- Job Start Latency histogram buckets. Specified in seconds.
     jobStartLatencyBuckets: "30,60,90,120,150,180,210,240,270,300"
+    # -- Labels to be added to the Spark Operator standard metrics, e.g., "label1Key,label2Key".
+    # Defaults to 'app_type' if not set.
+    labels: ""
 
   # Prometheus pod monitor for controller pods
   podMonitor:

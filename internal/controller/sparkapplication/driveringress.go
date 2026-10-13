@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
@@ -84,27 +85,40 @@ func getDriverIngressURL(ingressURLFormat string, app *v1beta2.SparkApplication)
 	return parsedURL, nil
 }
 
-func (r *Reconciler) createDriverIngress(ctx context.Context, app *v1beta2.SparkApplication, driverIngressConfiguration *v1beta2.DriverIngressConfiguration, service SparkService, ingressURL *url.URL, ingressClassName string) (*SparkIngress, error) {
+func (r *Reconciler) createDriverIngress(ctx context.Context, app *v1beta2.SparkApplication, driverIngressConfiguration *v1beta2.DriverIngressConfiguration, service SparkService, ingressURL *url.URL, ingressClassName string, defaultIngressTLS []networkingv1.IngressTLS, defaultIngressAnnotations map[string]string) (*SparkIngress, error) {
 	if driverIngressConfiguration.ServicePort == nil {
 		return nil, fmt.Errorf("cannot create Driver Ingress for application %s/%s due to empty ServicePort on driverIngressConfiguration", app.Namespace, app.Name)
 	}
 	ingressName := fmt.Sprintf("%s-ing-%d", app.Name, *driverIngressConfiguration.ServicePort)
-	if util.IngressCapabilities.Has("networking.k8s.io/v1") {
-		return r.createDriverIngressV1(ctx, app, service, ingressName, ingressURL, ingressClassName, []networkingv1.IngressTLS{}, map[string]string{})
+
+	// Resolve annotations and TLS: per-entry values take precedence, falling back
+	// to the operator-wide defaults when the per-entry fields are empty.
+	ingressAnnotations := driverIngressConfiguration.IngressAnnotations
+	if len(ingressAnnotations) == 0 {
+		ingressAnnotations = defaultIngressAnnotations
 	}
-	return r.createDriverIngressLegacy(ctx, app, service, ingressName, ingressURL)
+	ingressTLS := driverIngressConfiguration.IngressTLS
+	if len(ingressTLS) == 0 {
+		ingressTLS = defaultIngressTLS
+	}
+
+	if util.IngressCapabilities.Has("networking.k8s.io/v1") {
+		return r.createDriverIngressV1(ctx, app, service, ingressName, ingressURL, ingressClassName, ingressTLS, ingressAnnotations)
+	}
+	return r.createDriverIngressLegacy(ctx, app, service, ingressName, ingressURL, ingressTLS, ingressAnnotations)
 }
 
-func (r *Reconciler) createDriverIngressV1(ctx context.Context, app *v1beta2.SparkApplication, service SparkService, ingressName string, ingressURL *url.URL, ingressClassName string, defaultIngressTLS []networkingv1.IngressTLS, defaultIngressAnnotations map[string]string) (*SparkIngress, error) {
+func (r *Reconciler) createDriverIngressV1(ctx context.Context, app *v1beta2.SparkApplication, service SparkService, ingressName string, ingressURL *url.URL, ingressClassName string, ingressTLS []networkingv1.IngressTLS, ingressAnnotations map[string]string) (*SparkIngress, error) {
 	logger := log.FromContext(ctx)
-	ingressResourceAnnotations := util.GetWebUIIngressAnnotations(app)
-	if len(ingressResourceAnnotations) == 0 && len(defaultIngressAnnotations) != 0 {
-		ingressResourceAnnotations = defaultIngressAnnotations
+
+	// Copy the annotations into a new map so that the rewrite-target mutation below
+	// never modifies the caller's source map (either the user's SparkApplication
+	// spec or the operator-wide default options).
+	ingressResourceAnnotations := make(map[string]string, len(ingressAnnotations))
+	for key, value := range ingressAnnotations {
+		ingressResourceAnnotations[key] = value
 	}
-	ingressTLSHosts := util.GetWebUIIngressTLS(app)
-	if len(ingressTLSHosts) == 0 && len(defaultIngressTLS) != 0 {
-		ingressTLSHosts = defaultIngressTLS
-	}
+	ingressTLSHosts := ingressTLS
 
 	ingressURLPath := ingressURL.Path
 	// If we're serving on a subpath, we need to ensure we create capture groups
@@ -162,17 +176,31 @@ func (r *Reconciler) createDriverIngressV1(ctx context.Context, app *v1beta2.Spa
 		ingress.Spec.IngressClassName = &ingressClassName
 	}
 
-	if err := r.client.Create(ctx, ingress); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("failed to create ingress %s/%s: %v", ingress.Namespace, ingress.Name, err)
+	existingIngress := &networkingv1.Ingress{}
+	err := r.client.Get(ctx, client.ObjectKeyFromObject(ingress), existingIngress)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get ingress %s/%s: %v", ingress.Namespace, ingress.Name, err)
 		}
-
-		if err := r.client.Update(ctx, ingress); err != nil {
+		// Ingress does not exist, create it.
+		if err := r.client.Create(ctx, ingress); err != nil {
+			if !errors.IsAlreadyExists(err) {
+				return nil, fmt.Errorf("failed to create ingress %s/%s: %v", ingress.Namespace, ingress.Name, err)
+			}
+			logger.Info("Ingress already exists (race), skipping create", "ingressName", ingress.Name)
+		} else {
+			logger.Info("Created networking.v1/Ingress for SparkApplication", "ingressName", ingress.Name)
+		}
+	} else {
+		// Ingress already exists, update it.
+		existingIngress.Spec = ingress.Spec
+		existingIngress.Labels = ingress.Labels
+		existingIngress.Annotations = ingress.Annotations
+		existingIngress.OwnerReferences = ingress.OwnerReferences
+		if err := r.client.Update(ctx, existingIngress); err != nil {
 			return nil, fmt.Errorf("failed to update ingress %s/%s: %v", ingress.Namespace, ingress.Name, err)
 		}
 		logger.Info("Updated networking.v1/Ingress for SparkApplication", "ingressName", ingress.Name)
-	} else {
-		logger.Info("Created networking.v1/Ingress for SparkApplication", "ingressName", ingress.Name)
 	}
 
 	return &SparkIngress{
@@ -184,12 +212,19 @@ func (r *Reconciler) createDriverIngressV1(ctx context.Context, app *v1beta2.Spa
 	}, nil
 }
 
-func (r *Reconciler) createDriverIngressLegacy(ctx context.Context, app *v1beta2.SparkApplication, service SparkService, ingressName string, ingressURL *url.URL) (*SparkIngress, error) {
+func (r *Reconciler) createDriverIngressLegacy(ctx context.Context, app *v1beta2.SparkApplication, service SparkService, ingressName string, ingressURL *url.URL, ingressTLS []networkingv1.IngressTLS, ingressAnnotations map[string]string) (*SparkIngress, error) {
 	logger := log.FromContext(ctx)
-	ingressResourceAnnotations := util.GetWebUIIngressAnnotations(app)
+
+	// Copy the annotations into a new map so that the rewrite-target mutation below
+	// never modifies the caller's source map (either the user's SparkApplication
+	// spec or the operator-wide default options).
+	ingressResourceAnnotations := make(map[string]string, len(ingressAnnotations))
+	for key, value := range ingressAnnotations {
+		ingressResourceAnnotations[key] = value
+	}
 	// var ingressTLSHosts networkingv1.IngressTLS[]
 	// That we convert later for extensionsv1beta1, but return as is in SparkIngress.
-	ingressTLSHosts := util.GetWebUIIngressTLS(app)
+	ingressTLSHosts := ingressTLS
 
 	ingressURLPath := ingressURL.Path
 	// If we're serving on a subpath, we need to ensure we create capture groups.
@@ -239,17 +274,31 @@ func (r *Reconciler) createDriverIngressLegacy(ctx context.Context, app *v1beta2
 	if len(ingressTLSHosts) != 0 {
 		ingress.Spec.TLS = convertIngressTLSHostsToLegacy(ingressTLSHosts)
 	}
-	if err := r.client.Create(ctx, ingress); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("failed to create ingress %s/%s: %v", ingress.Namespace, ingress.Name, err)
+	existingLegacyIngress := &extensionsv1beta1.Ingress{}
+	err := r.client.Get(ctx, client.ObjectKeyFromObject(ingress), existingLegacyIngress)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get ingress %s/%s: %v", ingress.Namespace, ingress.Name, err)
 		}
-
-		if err := r.client.Update(ctx, ingress); err != nil {
+		// Ingress does not exist, create it.
+		if err := r.client.Create(ctx, ingress); err != nil {
+			if !errors.IsAlreadyExists(err) {
+				return nil, fmt.Errorf("failed to create ingress %s/%s: %v", ingress.Namespace, ingress.Name, err)
+			}
+			logger.Info("Ingress already exists (race), skipping create", "ingressName", ingress.Name)
+		} else {
+			logger.Info("Created extensions.v1beta1/Ingress for SparkApplication", "ingressName", ingress.Name)
+		}
+	} else {
+		// Ingress already exists, update it.
+		existingLegacyIngress.Spec = ingress.Spec
+		existingLegacyIngress.Labels = ingress.Labels
+		existingLegacyIngress.Annotations = ingress.Annotations
+		existingLegacyIngress.OwnerReferences = ingress.OwnerReferences
+		if err := r.client.Update(ctx, existingLegacyIngress); err != nil {
 			return nil, fmt.Errorf("failed to update ingress %s/%s: %v", ingress.Namespace, ingress.Name, err)
 		}
 		logger.Info("Updated extensions.v1beta1/Ingress for SparkApplication", "ingressName", ingress.Name)
-	} else {
-		logger.Info("Created extensions.v1beta1/Ingress for SparkApplication", "ingressName", ingress.Name)
 	}
 
 	return &SparkIngress{
@@ -312,23 +361,59 @@ func (r *Reconciler) createDriverIngressService(
 	if len(serviceLabels) != 0 {
 		service.Labels = serviceLabels
 	}
+	service.Labels[common.LabelCreatedBySparkOperator] = "true"
 
 	if len(serviceAnnotations) != 0 {
 		service.Annotations = serviceAnnotations
 	}
 
-	if err := r.client.Create(ctx, service); err != nil {
-		if !errors.IsAlreadyExists(err) {
+	existing := &corev1.Service{}
+	err := r.client.Get(ctx, client.ObjectKeyFromObject(service), existing)
+	if err != nil {
+		if !errors.IsNotFound(err) {
 			return nil, err
 		}
-
-		// Update the service if it already exists.
-		if err := r.client.Update(ctx, service); err != nil {
-			return nil, err
+		// Service does not exist, create it.
+		if err := r.client.Create(ctx, service); err != nil {
+			if !errors.IsAlreadyExists(err) {
+				return nil, err
+			}
+			// Handle upgrade scenario: Service exists in the cluster but is not
+			// visible in the filtered cache because it was created before the
+			// LabelCreatedBySparkOperator label selector was added to the informer.
+			// Use Patch (merge patch) instead of Update because we cannot Get the
+			// object from the filtered cache to obtain its resourceVersion.
+			base := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      service.Name,
+					Namespace: service.Namespace,
+				},
+			}
+			desired := base.DeepCopy()
+			desired.Labels = service.Labels
+			desired.Annotations = service.Annotations
+			desired.OwnerReferences = service.OwnerReferences
+			desired.Spec = service.Spec
+			if err := r.client.Patch(ctx, desired, client.MergeFrom(base)); err != nil {
+				return nil, err
+			}
+			service = desired
 		}
-		logger.Info("Updated service for SparkApplication", "name", service.Name)
-	} else {
 		logger.Info("Created service for SparkApplication", "name", service.Name)
+	} else {
+		// Service already exists, update only mutable fields to preserve
+		// immutable fields like ClusterIP, ClusterIPs, and IPFamilies.
+		existing.Spec.Ports = service.Spec.Ports
+		existing.Spec.Selector = service.Spec.Selector
+		existing.Spec.Type = service.Spec.Type
+		existing.Labels = service.Labels
+		existing.Annotations = service.Annotations
+		existing.OwnerReferences = service.OwnerReferences
+		if err := r.client.Update(ctx, existing); err != nil {
+			return nil, err
+		}
+		service = existing
+		logger.Info("Updated service for SparkApplication", "name", service.Name)
 	}
 
 	return &SparkService{

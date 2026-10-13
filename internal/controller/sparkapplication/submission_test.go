@@ -18,13 +18,19 @@ package sparkapplication
 
 import (
 	"fmt"
+	"os"
 	"slices"
+	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
 	"github.com/kubeflow/spark-operator/v2/pkg/common"
@@ -68,16 +74,16 @@ func TestExecutorConfOption(t *testing.T) {
 				},
 				Spec: v1beta2.SparkApplicationSpec{
 					Executor: v1beta2.ExecutorSpec{
-						CoreRequest: util.StringPtr("2"),
+						CoreRequest: ptr.To("2"),
 						SparkPodSpec: v1beta2.SparkPodSpec{
-							Image:          util.StringPtr("custom-executor:v1"),
-							Cores:          util.Int32Ptr(4),
-							CoreLimit:      util.StringPtr("4"),
-							Memory:         util.StringPtr("4g"),
-							MemoryOverhead: util.StringPtr("1g"),
+							Image:          ptr.To("custom-executor:v1"),
+							Cores:          ptr.To[int32](4),
+							CoreLimit:      ptr.To("4"),
+							Memory:         ptr.To("4g"),
+							MemoryOverhead: ptr.To("1g"),
 						},
-						Instances:           util.Int32Ptr(3),
-						DeleteOnTermination: util.BoolPtr(true),
+						Instances:           ptr.To[int32](3),
+						DeleteOnTermination: ptr.To(true),
 					},
 				},
 			},
@@ -94,6 +100,31 @@ func TestExecutorConfOption(t *testing.T) {
 				"--conf", fmt.Sprintf("%s=%s", common.SparkExecutorMemoryOverhead, "1g"),
 				"--conf", fmt.Sprintf("%s=%d", common.SparkExecutorInstances, 3),
 				"--conf", fmt.Sprintf("%s=%t", common.SparkKubernetesExecutorDeleteOnTermination, true),
+			},
+		},
+		{
+			name: "kueue labels on SparkApplication should not be propagated to executor conf",
+			app: &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "spark-kueue",
+					Labels: map[string]string{
+						"environment":               "production",
+						"kueue.x-k8s.io/queue-name": "high-priority",
+					},
+				},
+				Status: v1beta2.SparkApplicationStatus{
+					SubmissionID: "minimal-123",
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					Executor: v1beta2.ExecutorSpec{},
+				},
+			},
+			expected: []string{
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, "environment"), "production"),
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, common.LabelSparkAppName), "spark-kueue"),
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, common.LabelLaunchedBySparkOperator), "true"),
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, common.LabelMutatedBySparkOperator), "true"),
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, common.LabelSubmissionID), "minimal-123"),
 			},
 		},
 	}
@@ -200,6 +231,45 @@ func TestDriverVolumeMountsOption(t *testing.T) {
 					"10Gi"),
 			},
 		},
+		{
+			name: "emptydir volume with memory medium",
+			app: &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "spark-emptydir-memory",
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					Volumes: []corev1.Volume{
+						{
+							Name: fmt.Sprintf("%semptydir", common.SparkLocalDirVolumePrefix),
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{
+									Medium: corev1.StorageMediumMemory,
+								},
+							},
+						},
+					},
+					Driver: v1beta2.DriverSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      fmt.Sprintf("%semptydir", common.SparkLocalDirVolumePrefix),
+									MountPath: "/tmp/scratch",
+									ReadOnly:  false,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []string{
+				"--conf", fmt.Sprintf("%s=%s",
+					fmt.Sprintf(common.SparkKubernetesDriverVolumesMountPathTemplate, common.VolumeTypeEmptyDir, fmt.Sprintf("%semptydir", common.SparkLocalDirVolumePrefix)),
+					"/tmp/scratch"),
+				"--conf", fmt.Sprintf("%s=%s",
+					fmt.Sprintf(common.SparkKubernetesDriverVolumesOptionsTemplate, common.VolumeTypeEmptyDir, fmt.Sprintf("%semptydir", common.SparkLocalDirVolumePrefix), "medium"),
+					string(corev1.StorageMediumMemory)),
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -239,10 +309,10 @@ func TestDriverConfOption(t *testing.T) {
 				Spec: v1beta2.SparkApplicationSpec{
 					Driver: v1beta2.DriverSpec{
 						SparkPodSpec: v1beta2.SparkPodSpec{
-							Cores:      util.Int32Ptr(2),
-							CoreLimit:  util.StringPtr("2"),
-							Memory:     util.StringPtr("2g"),
-							Image:      util.StringPtr("spark-driver:latest"),
+							Cores:      ptr.To[int32](2),
+							CoreLimit:  ptr.To("2"),
+							Memory:     ptr.To("2g"),
+							Image:      ptr.To("spark-driver:latest"),
 							ConfigMaps: []v1beta2.NamePath{{Name: "driver-config", Path: "/etc/config"}},
 						},
 					},
@@ -275,6 +345,31 @@ func TestDriverConfOption(t *testing.T) {
 				},
 			},
 			expected: []string{
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelSparkAppName), "spark-minimal"),
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelLaunchedBySparkOperator), "true"),
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelMutatedBySparkOperator), "true"),
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelSubmissionID), "minimal-123"),
+			},
+		},
+		{
+			name: "kueue labels on SparkApplication should not be propagated to driver conf",
+			app: &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "spark-minimal",
+					Labels: map[string]string{
+						"environment":               "production",
+						"kueue.x-k8s.io/queue-name": "high-priority",
+					},
+				},
+				Status: v1beta2.SparkApplicationStatus{
+					SubmissionID: "minimal-123",
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					Driver: v1beta2.DriverSpec{},
+				},
+			},
+			expected: []string{
+				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, "environment"), "production"),
 				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelSparkAppName), "spark-minimal"),
 				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelLaunchedBySparkOperator), "true"),
 				"--conf", fmt.Sprintf("%s=%s", fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, common.LabelMutatedBySparkOperator), "true"),
@@ -343,6 +438,264 @@ func TestDriverConfOption(t *testing.T) {
 			assert.Equal(t, testCase.expected, options, "Driver configuration options do not match expected values")
 		})
 	}
+}
+
+func TestDriverPodTemplateContents(t *testing.T) {
+	appName := "test"
+	uid := types.UID(uuid.New().String())
+	appOwnerReference := util.GetOwnerReference(&v1beta2.SparkApplication{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: appName,
+			UID:  uid,
+		},
+	})
+	for name, tc := range map[string]struct {
+		app              *v1beta2.SparkApplication
+		expectedTemplate corev1.PodTemplateSpec
+	}{
+		"no pod template": {
+			app: &v1beta2.SparkApplication{},
+			expectedTemplate: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{appOwnerReference},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: common.SparkDriverContainerName,
+					}},
+				},
+			},
+		},
+		"with pod template": {
+			app: &v1beta2.SparkApplication{
+				Spec: v1beta2.SparkApplicationSpec{
+					Driver: v1beta2.DriverSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							Template: &corev1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									OwnerReferences: []metav1.OwnerReference{{Name: "owner-in-template"}},
+								},
+								Spec: corev1.PodSpec{
+									Containers: []corev1.Container{
+										{Name: common.SparkDriverContainerName, Image: "image"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedTemplate: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{Name: "owner-in-template"},
+						appOwnerReference,
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: common.SparkDriverContainerName, Image: "image"},
+					},
+				},
+			},
+		},
+		"pod template already has owner references": {
+			app: &v1beta2.SparkApplication{
+				Spec: v1beta2.SparkApplicationSpec{
+					Driver: v1beta2.DriverSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							Template: &corev1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									OwnerReferences: []metav1.OwnerReference{{Name: "owner-in-template"}, appOwnerReference},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedTemplate: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{Name: "owner-in-template"},
+						appOwnerReference,
+					},
+				},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			submissionID := "TestDriverPodTemplateOption-" + strings.ReplaceAll(name, " ", "_") + "-" + uuid.New().String()
+			tc.app.Name = appName
+			tc.app.UID = uid
+			tc.app.Status.SubmissionID = submissionID
+
+			_, err := driverPodTemplateOption(tc.app)
+			assert.NoError(t, err)
+			defer func() { _ = os.RemoveAll(fmt.Sprintf("/tmp/spark/%s", submissionID)) }()
+
+			expectedBytes, err := yaml.Marshal(tc.expectedTemplate)
+			assert.NoError(t, err)
+
+			actualBytes, err := os.ReadFile(fmt.Sprintf("/tmp/spark/%s/driver-pod-template.yaml", submissionID))
+			assert.NoError(t, err)
+
+			assert.Equal(t, string(expectedBytes), string(actualBytes))
+		})
+	}
+}
+
+func TestExecutorPodTemplateContents(t *testing.T) {
+	appName := "test"
+	uid := types.UID(uuid.New().String())
+	appNonControllerOwnerReference := util.GetOwnerReference(&v1beta2.SparkApplication{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: appName,
+			UID:  uid,
+		},
+	})
+	appNonControllerOwnerReference.Controller = nil
+	appNonControllerOwnerReference.BlockOwnerDeletion = nil
+
+	for name, tc := range map[string]struct {
+		app              *v1beta2.SparkApplication
+		expectedTemplate corev1.PodTemplateSpec
+	}{
+		"no pod template": {
+			app: &v1beta2.SparkApplication{},
+			expectedTemplate: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: common.Spark3DefaultExecutorContainerName,
+					}},
+				},
+			},
+		},
+		"with pod template": {
+			app: &v1beta2.SparkApplication{
+				Spec: v1beta2.SparkApplicationSpec{
+					Executor: v1beta2.ExecutorSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							Template: &corev1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									OwnerReferences: []metav1.OwnerReference{{Name: "owner-in-template"}},
+								},
+								Spec: corev1.PodSpec{
+									Containers: []corev1.Container{
+										{Name: common.Spark3DefaultExecutorContainerName, Image: "image"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedTemplate: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{Name: "owner-in-template"},
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: common.Spark3DefaultExecutorContainerName, Image: "image"},
+					},
+				},
+			},
+		},
+		"pod template already has owner references": {
+			app: &v1beta2.SparkApplication{
+				Spec: v1beta2.SparkApplicationSpec{
+					Executor: v1beta2.ExecutorSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							Template: &corev1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									OwnerReferences: []metav1.OwnerReference{{Name: "owner-in-template"}, appNonControllerOwnerReference},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedTemplate: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{Name: "owner-in-template"},
+						appNonControllerOwnerReference,
+					},
+				},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			submissionID := "TestExecutorPodTemplateOption-" + strings.ReplaceAll(name, " ", "_") + "-" + uuid.New().String()
+			tc.app.Name = appName
+			tc.app.UID = uid
+			tc.app.Status.SubmissionID = submissionID
+
+			_, err := executorPodTemplateOption(tc.app)
+			assert.NoError(t, err)
+			defer func() { _ = os.RemoveAll(fmt.Sprintf("/tmp/spark/%s", submissionID)) }()
+
+			expectedBytes, err := yaml.Marshal(tc.expectedTemplate)
+			assert.NoError(t, err)
+
+			actualBytes, err := os.ReadFile(fmt.Sprintf("/tmp/spark/%s/executor-pod-template.yaml", submissionID))
+			assert.NoError(t, err)
+
+			assert.Equal(t, string(expectedBytes), string(actualBytes))
+		})
+	}
+}
+
+func TestBuildSparkSubmitArgsSkipPodTemplates(t *testing.T) {
+	t.Setenv("KUBERNETES_SERVICE_HOST", "127.0.0.1")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "6443")
+
+	app := &v1beta2.SparkApplication{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-app",
+			Namespace: "default",
+			UID:       "uid-123",
+		},
+		Spec: v1beta2.SparkApplicationSpec{
+			Type:                v1beta2.SparkApplicationTypeScala,
+			Mode:                v1beta2.DeployModeCluster,
+			MainApplicationFile: ptr.To("local:///app.jar"),
+			MainClass:           ptr.To("org.example.Main"),
+			SparkVersion:        "4.0.4",
+		},
+		Status: v1beta2.SparkApplicationStatus{
+			SubmissionID: "sub-123",
+		},
+	}
+
+	t.Run("includes pod template args when skipPodTemplates is false", func(t *testing.T) {
+		args, err := buildSparkSubmitArgs(app, false)
+		assert.NoError(t, err)
+
+		hasDriverTemplate := slices.ContainsFunc(args, func(s string) bool {
+			return strings.Contains(s, common.SparkKubernetesDriverPodTemplateFile)
+		})
+		hasExecutorTemplate := slices.ContainsFunc(args, func(s string) bool {
+			return strings.Contains(s, common.SparkKubernetesExecutorPodTemplateFile)
+		})
+		assert.True(t, hasDriverTemplate, "should include driver pod template conf")
+		assert.True(t, hasExecutorTemplate, "should include executor pod template conf")
+	})
+
+	t.Run("skips pod template args when skipPodTemplates is true", func(t *testing.T) {
+		args, err := buildSparkSubmitArgs(app, true)
+		assert.NoError(t, err)
+
+		hasDriverTemplate := slices.ContainsFunc(args, func(s string) bool {
+			return strings.Contains(s, common.SparkKubernetesDriverPodTemplateFile)
+		})
+		hasExecutorTemplate := slices.ContainsFunc(args, func(s string) bool {
+			return strings.Contains(s, common.SparkKubernetesExecutorPodTemplateFile)
+		})
+		assert.False(t, hasDriverTemplate, "should not include driver pod template conf")
+		assert.False(t, hasExecutorTemplate, "should not include executor pod template conf")
+	})
 }
 
 // import (
@@ -916,10 +1269,10 @@ func TestDriverConfOption(t *testing.T) {
 // 		Spec: v1beta2.SparkApplicationSpec{
 // 			DynamicAllocation: &v1beta2.DynamicAllocation{
 // 				Enabled:                true,
-// 				InitialExecutors:       util.Int32Ptr(2),
-// 				MinExecutors:           util.Int32Ptr(0),
-// 				MaxExecutors:           util.Int32Ptr(10),
-// 				ShuffleTrackingTimeout: util.Int64Ptr(6000000),
+// 				InitialExecutors:       ptr.To[int32](2),
+// 				MinExecutors:           ptr.To[int32](0),
+// 				MaxExecutors:           ptr.To[int32](10),
+// 				ShuffleTrackingTimeout: ptr.To[int64](6000000),
 // 			},
 // 		},
 // 	}
@@ -954,7 +1307,7 @@ func TestDriverConfOption(t *testing.T) {
 // 		},
 // 		Spec: v1beta2.SparkApplicationSpec{
 // 			Mode:      v1beta2.ClusterMode,
-// 			ProxyUser: util.StringPtr("foo"),
+// 			ProxyUser: ptr.To("foo"),
 // 		},
 // 	}
 

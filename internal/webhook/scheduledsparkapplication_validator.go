@@ -18,8 +18,13 @@ package webhook
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
@@ -36,45 +41,74 @@ func NewScheduledSparkApplicationValidator() *ScheduledSparkApplicationValidator
 	return &ScheduledSparkApplicationValidator{}
 }
 
-var _ admission.CustomValidator = &ScheduledSparkApplicationValidator{}
+var _ admission.Validator[*v1beta2.ScheduledSparkApplication] = &ScheduledSparkApplicationValidator{}
 
-// ValidateCreate implements admission.CustomValidator.
-func (v *ScheduledSparkApplicationValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
-	app, ok := obj.(*v1beta2.ScheduledSparkApplication)
-	if !ok {
+// ValidateCreate implements admission.Validator.
+func (v *ScheduledSparkApplicationValidator) ValidateCreate(ctx context.Context, app *v1beta2.ScheduledSparkApplication) (warnings admission.Warnings, err error) {
+	if app == nil {
 		return nil, nil
 	}
-	logger.Info("Validating SchedulingSparkApplication create", "name", app.Name, "namespace", app.Namespace)
+
+	logger := log.FromContext(ctx)
+	logger.Info("Validating ScheduledSparkApplication create")
+	// Validate metadata.name early to prevent downstream Service creation failures
+	if err := v.validateName(app.Name); err != nil {
+		return nil, err
+	}
 	if err := v.validate(app); err != nil {
 		return nil, err
 	}
 	return nil, nil
 }
 
-// ValidateUpdate implements admission.CustomValidator.
-func (v *ScheduledSparkApplicationValidator) ValidateUpdate(ctx context.Context, oldObj runtime.Object, newObj runtime.Object) (warnings admission.Warnings, err error) {
-	newApp, ok := newObj.(*v1beta2.ScheduledSparkApplication)
-	if !ok {
+// ValidateUpdate implements admission.Validator.
+func (v *ScheduledSparkApplicationValidator) ValidateUpdate(ctx context.Context, oldApp *v1beta2.ScheduledSparkApplication, newApp *v1beta2.ScheduledSparkApplication) (warnings admission.Warnings, err error) {
+	if oldApp == nil || newApp == nil {
 		return nil, nil
 	}
-	logger.Info("Validating SchedulingSparkApplication update", "name", newApp.Name, "namespace", newApp.Namespace)
+
+	logger := log.FromContext(ctx)
+	logger.Info("Validating ScheduledSparkApplication update")
+	// Name is immutable in Kubernetes, but validate anyway for safety in case of admission reconcilers
+	if err := v.validateName(newApp.Name); err != nil {
+		return nil, err
+	}
+
+	// Skip validating when spec does not change.
+	if equality.Semantic.DeepEqual(oldApp.Spec, newApp.Spec) {
+		return nil, nil
+	}
+
 	if err := v.validate(newApp); err != nil {
 		return nil, err
 	}
 	return nil, nil
 }
 
-// ValidateDelete implements admission.CustomValidator.
-func (v *ScheduledSparkApplicationValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
-	app, ok := obj.(*v1beta2.ScheduledSparkApplication)
-	if !ok {
+// ValidateDelete implements admission.Validator.
+func (v *ScheduledSparkApplicationValidator) ValidateDelete(ctx context.Context, app *v1beta2.ScheduledSparkApplication) (warnings admission.Warnings, err error) {
+	if app == nil {
 		return nil, nil
 	}
-	logger.Info("Validating ScheduledSparkApplication delete", "name", app.Name, "namespace", app.Namespace)
+
+	logger := log.FromContext(ctx)
+	logger.Info("Validating ScheduledSparkApplication delete")
 	return nil, nil
 }
 
-func (v *ScheduledSparkApplicationValidator) validate(_ *v1beta2.ScheduledSparkApplication) error {
-	// TODO: implement validate logic
+func (v *ScheduledSparkApplicationValidator) validate(app *v1beta2.ScheduledSparkApplication) error {
+	if err := validateSparkConf(app.Spec.Template.SparkConf, app.Namespace); err != nil {
+		return err
+	}
+	return validateConfigMaps(&app.Spec.Template, field.NewPath("spec", "template"))
+}
+
+// validateName ensures the ScheduledSparkApplication metadata.name, when combined with suffixes,
+// results in a valid DNS-1035 label for Kubernetes Service names. This prevents failures later
+// when creating SparkApplication resources that require DNS-1035 compliant names.
+func (v *ScheduledSparkApplicationValidator) validateName(name string) error {
+	if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
+		return fmt.Errorf("invalid ScheduledSparkApplication name %q: %s", name, strings.Join(errs, ", "))
+	}
 	return nil
 }

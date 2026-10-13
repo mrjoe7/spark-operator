@@ -123,6 +123,20 @@ tests:
           path: spec.template.metadata.annotations.key2
           value: value2
 
+  - it: Should add deployment annotations if `controller.deploymentAnnotations` is set
+    set:
+      controller:
+        deploymentAnnotations:
+          key1: value1
+          key2: value2
+    asserts:
+      - equal:
+          path: metadata.annotations.key1
+          value: value1
+      - equal:
+          path: metadata.annotations.key2
+          value: value2
+
   - it: Should contain `--zap-log-level` arg if `controller.logLevel` is set
     set:
       controller:
@@ -162,6 +176,63 @@ tests:
       - contains:
           path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
           content: --controller-threads=30
+
+  - it: Should contain `--default-time-to-live-seconds` arg if `controller.defaultTimeToLiveSeconds` is set and the `DefaultTimeToLive` feature gate is enabled
+    set:
+      controller:
+        defaultTimeToLiveSeconds: 86400
+        featureGates:
+          - name: DefaultTimeToLive
+            enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --default-time-to-live-seconds=86400
+
+  - it: Should not contain `--default-time-to-live-seconds` arg when the `DefaultTimeToLive` feature gate is disabled even if `controller.defaultTimeToLiveSeconds` is set
+    set:
+      controller:
+        defaultTimeToLiveSeconds: 86400
+        featureGates:
+          - name: DefaultTimeToLive
+            enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --default-time-to-live-seconds=86400
+
+  - it: Should not contain `--default-time-to-live-seconds` arg when the `DefaultTimeToLive` feature gate is not set even if `controller.defaultTimeToLiveSeconds` is set
+    set:
+      controller:
+        defaultTimeToLiveSeconds: 86400
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --default-time-to-live-seconds=86400
+
+  - it: Should contain `--default-time-to-live-seconds=0` arg when `controller.defaultTimeToLiveSeconds` is 0 and the `DefaultTimeToLive` feature gate is enabled
+    set:
+      controller:
+        defaultTimeToLiveSeconds: 0
+        featureGates:
+          - name: DefaultTimeToLive
+            enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --default-time-to-live-seconds=0
+
+  - it: Should not contain `--default-time-to-live-seconds` arg when `controller.defaultTimeToLiveSeconds` is negative and the `DefaultTimeToLive` feature gate is enabled
+    set:
+      controller:
+        defaultTimeToLiveSeconds: -1
+        featureGates:
+          - name: DefaultTimeToLive
+            enabled: true
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --default-time-to-live-seconds=-1
 
   - it: Should contain `--enable-ui-service` arg if `controller.uiService.enable` is set to `true`
     set:
@@ -240,6 +311,22 @@ tests:
           path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
           content: --enable-batch-scheduler=true
 
+  - it: Should not contain `--enable-driver-pdb` arg by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --enable-driver-pdb=true
+
+  - it: Should contain `--enable-driver-pdb` arg if `controller.driverPodDisruptionBudget.enable` is `true`
+    set:
+      controller:
+        driverPodDisruptionBudget:
+          enable: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --enable-driver-pdb=true
+
   - it: Should contain `--default-batch-scheduler` arg if `controller.batchScheduler.default` is set
     set:
       controller:
@@ -251,6 +338,24 @@ tests:
           path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
           content: --default-batch-scheduler=yunikorn
 
+  - it: Should contain `--default-service-account` arg if `controller.defaultServiceAccount` is set
+    set:
+      controller:
+        defaultServiceAccount: spark-operator-spark
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --default-service-account=spark-operator-spark
+
+  - it: Should not contain `--default-service-account` arg if `controller.defaultServiceAccount` is empty
+    set:
+      controller:
+        defaultServiceAccount: ""
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --default-service-account=
+  
   - it: Should contain `--enable-metrics` arg if `prometheus.metrics.enable` is set to `true`
     set:
       prometheus:
@@ -260,6 +365,7 @@ tests:
           portName: test-port
           endpoint: /test-endpoint
           prefix: test-prefix
+          jobSubmitLatencyBuckets: "1,2,4,8,16"
           jobStartLatencyBuckets: "180,360,420,690"
     asserts:
       - contains:
@@ -277,6 +383,41 @@ tests:
       - contains:
           path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
           content: --metrics-labels=app_type
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --metrics-job-submit-latency-buckets=1,2,4,8,16
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --metrics-job-start-latency-buckets=180,360,420,690
+ 
+  - it: Should set metrics-labels arg if `prometheus.metrics.labels` is set to not empty
+    set:
+      prometheus:
+        metrics:
+          enable: true
+          port: 12345
+          portName: test-port
+          endpoint: /test-endpoint
+          prefix: test-prefix
+          jobSubmitLatencyBuckets: "1,2,4,8,16"
+          jobStartLatencyBuckets: "180,360,420,690"
+          labels: test1,test2
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --enable-metrics=true
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --metrics-bind-address=:12345
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --metrics-endpoint=/test-endpoint
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --metrics-prefix=test-prefix
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --metrics-labels=test1,test2
       - contains:
           path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
           content: --metrics-job-start-latency-buckets=180,360,420,690
@@ -668,6 +809,71 @@ tests:
       - failedTemplate:
           errorMessage: "controller.replicas must be greater than 1 to enable topology spread constraints for controller pods"
 
+  - it: Should include hostUsers when kubernetes version >= 1.30 and hostUsers is true
+    capabilities:
+      majorVersion: 1
+      minorVersion: 30
+    set:
+      controller:
+        hostUsers: true
+    asserts:
+      - equal:
+          path: spec.template.spec.hostUsers
+          value: true
+
+  - it: Should include hostUsers when kubernetes version >= 1.30 and hostUsers is false
+    capabilities:
+      majorVersion: 1
+      minorVersion: 34
+    set:
+      controller:
+        hostUsers: false
+    asserts:
+      - equal:
+          path: spec.template.spec.hostUsers
+          value: false
+
+  - it: Should not contain hostUsers when kubernetes version < 1.29 and hostUsers is set
+    capabilities:
+      majorVersion: 1
+      minorVersion: 29
+    set:
+      controller:
+        hostUsers: true
+    asserts:
+      - notExists:
+          path: spec.template.spec.hostUsers
+
+  - it: Should not include hostUsers when kubernetes version >= 1.30 but value not set
+    capabilities:
+      majorVersion: 1
+      minorVersion: 34
+    asserts:
+      - notExists:
+          path: spec.template.spec.hostUsers
+
+  - it: Should should NOT include hostUsers when kubernetes version >= 1.30 but value is string
+    capabilities:
+      majorVersion: 1
+      minorVersion: 34
+    set:
+      controller:
+        hostUsers: "true"
+    asserts:
+      - notExists:
+          path: spec.template.spec.hostUsers
+
+  - it: Should not include hostUsers when kubernetes version >= 1.30 but value is null
+    capabilities:
+      majorVersion: 1
+      minorVersion: 34
+    set:
+      controller:
+        hostUsers: null
+    asserts:
+      - notExists:
+          path: spec.template.spec.hostUsers
+
   - it: Should contain `--pprof-bind-address` arg if `controller.pprof.enable` is set to `true`
     set:
       controller:
@@ -762,4 +968,105 @@ tests:
       - contains:
           path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
           content: --leader-election-retry-period=15s
+
+  - it: Should not contain `--feature-gates` arg if `controller.featureGates` is not set
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          pattern: --feature-gates=.*
+
+  - it: Should contain `--feature-gates` arg with single feature gate if `controller.featureGates` is set
+    set:
+      controller:
+        featureGates:
+          - name: PartialRestart
+            enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --feature-gates=PartialRestart=true
+
+  - it: Should contain `--feature-gates` arg with multiple feature gates if `controller.featureGates` is set
+    set:
+      controller:
+        featureGates:
+          - name: PartialRestart
+            enabled: true
+          - name: AnotherFeature
+            enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --feature-gates=PartialRestart=true,AnotherFeature=false
+
+  - it: Should render submitter args when RestSubmitter feature gate is enabled
+    set:
+      controller:
+        featureGates:
+        - name: RestSubmitter
+          enabled: true
+      submitter:
+        serviceUrl: http://my-submitter:8080/api/v1/spark-submit
+        requestTimeout: 3m
+        startupTimeout: 10m
+        maxRetries: 5
+        initialBackoff: 5s
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submitter-service-url=http://my-submitter:8080/api/v1/spark-submit
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submitter-request-timeout=3m
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submitter-startup-timeout=10m
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submitter-max-retries=5
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submitter-initial-backoff=5s
+
+  - it: Should not render submitter args when RestSubmitter feature gate is disabled
+    set:
+      controller:
+        featureGates:
+        - name: RestSubmitter
+          enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].args
+          content: --submitter-service-url=http://spark-operator-submitter-svc:8080/api/v1/spark-submit
+
+  - it: Should render startup probe when RestSubmitter feature gate is enabled
+    set:
+      controller:
+        featureGates:
+        - name: RestSubmitter
+          enabled: true
+      submitter:
+        startupProbe:
+          periodSeconds: 10
+          failureThreshold: 30
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].startupProbe.httpGet.path
+          value: /healthz
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].startupProbe.periodSeconds
+          value: 10
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].startupProbe.failureThreshold
+          value: 30
+
+  - it: Should not render startup probe when RestSubmitter feature gate is disabled
+    set:
+      controller:
+        featureGates:
+        - name: RestSubmitter
+          enabled: false
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[?(@.name=="spark-operator-controller")].startupProbe
 

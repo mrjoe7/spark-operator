@@ -44,6 +44,15 @@ const (
 
 	SparkExecutorMemory = "spark.executor.memory"
 
+	// SparkDriverGPUDiscoveryScript is the configuration property for the driver GPU discovery script.
+	SparkDriverGPUDiscoveryScript = "spark.driver.resource.gpu.discoveryScript"
+
+	// SparkExecutorGPUDiscoveryScript is the configuration property for the executor GPU discovery script.
+	SparkExecutorGPUDiscoveryScript = "spark.executor.resource.gpu.discoveryScript"
+
+	// SparkResourcesDiscoveryPlugin is the configuration property for resource discovery plugins.
+	SparkResourcesDiscoveryPlugin = "spark.resources.discoveryPlugin"
+
 	SparkExecutorMemoryOverhead = "spark.executor.memoryOverhead"
 
 	SparkUIProxyBase = "spark.ui.proxyBase"
@@ -51,9 +60,13 @@ const (
 	SparkUIProxyRedirectURI = "spark.ui.proxyRedirectUri"
 )
 
+// Spark core properties.
+const (
+	SparkMaster = "spark.master"
+)
+
 // Spark on Kubernetes properties.
 const (
-
 	// SparkKubernetesDriverMaster is the Spark configuration key for specifying the Kubernetes master the driver use
 	// to manage executor pods and other Kubernetes resources.
 	SparkKubernetesDriverMaster = "spark.kubernetes.driver.master"
@@ -81,6 +94,24 @@ const (
 
 	// account used by the executor pod.
 	SparkKubernetesAuthenticateExecutorServiceAccountName = "spark.kubernetes.authenticate.executor.serviceAccountName"
+
+	// SparkKubernetesAuthenticateOAuthTokenFile is the configuration property for the submission client's OAuth token file.
+	SparkKubernetesAuthenticateOAuthTokenFile = "spark.kubernetes.authenticate.oauthTokenFile"
+
+	// SparkKubernetesAuthenticateOAuthToken is the configuration property for the submission client's OAuth token.
+	SparkKubernetesAuthenticateOAuthToken = "spark.kubernetes.authenticate.oauthToken"
+
+	// SparkKubernetesAuthenticateDriverOAuthTokenFile is the configuration property for the driver pod's OAuth token file.
+	SparkKubernetesAuthenticateDriverOAuthTokenFile = "spark.kubernetes.authenticate.driver.oauthTokenFile"
+
+	// SparkKubernetesAuthenticateDriverOAuthToken is the configuration property for the driver pod's OAuth token.
+	SparkKubernetesAuthenticateDriverOAuthToken = "spark.kubernetes.authenticate.driver.oauthToken"
+
+	// SparkKubernetesAuthenticateExecutorOAuthTokenFile is the configuration property for the executor pod's OAuth token file.
+	SparkKubernetesAuthenticateExecutorOAuthTokenFile = "spark.kubernetes.authenticate.executor.oauthTokenFile"
+
+	// SparkKubernetesAuthenticateExecutorOAuthToken is the configuration property for the executor pod's OAuth token.
+	SparkKubernetesAuthenticateExecutorOAuthToken = "spark.kubernetes.authenticate.executor.oauthToken"
 
 	// SparkKubernetesDriverLabelPrefix is the Spark configuration key prefix for labels on the driver Pod.
 	SparkKubernetesDriverLabelTemplate = "spark.kubernetes.driver.label.%s"
@@ -216,6 +247,10 @@ const (
 
 	// SparkKubernetesExecutorDeleteOnTermination is the Spark configuration for specifying whether executor pods should be deleted in case of failure or normal termination.
 	SparkKubernetesExecutorDeleteOnTermination = "spark.kubernetes.executor.deleteOnTermination"
+
+	// SparkOperatorManagerName is the default manager name for spec.managedBy.
+	// When the field is unset or equals this value, the built-in operator manages the application.
+	SparkOperatorManagerName = "sparkoperator.k8s.io/spark-operator"
 )
 
 // Dynamic allocation properties.

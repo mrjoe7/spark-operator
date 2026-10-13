@@ -32,8 +32,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,14 +52,35 @@ var (
 )
 
 type Options struct {
-	Namespaces []string
+	Namespaces         []string
+	NamespaceSelector  string
+	TimestampPrecision string
+}
+
+// formatTimestamp formats the given time according to the specified precision.
+// Supported precisions: nanos (default), micros, millis, seconds, minutes.
+func formatTimestamp(t time.Time, precision string) string {
+	switch precision {
+	case "minutes":
+		return fmt.Sprintf("%d", t.Unix()/60)
+	case "seconds":
+		return fmt.Sprintf("%d", t.Unix())
+	case "millis":
+		return fmt.Sprintf("%d", t.UnixMilli())
+	case "micros":
+		return fmt.Sprintf("%d", t.UnixMicro())
+	case "nanos":
+		fallthrough
+	default:
+		return fmt.Sprintf("%d", t.UnixNano())
+	}
 }
 
 // Reconciler reconciles a ScheduledSparkApplication object
 type Reconciler struct {
 	scheme   *runtime.Scheme
 	client   client.Client
-	recorder record.EventRecorder
+	recorder events.EventRecorder
 	clock    clock.Clock
 	options  Options
 }
@@ -68,7 +90,7 @@ var _ reconcile.Reconciler = &Reconciler{}
 func NewReconciler(
 	scheme *runtime.Scheme,
 	client client.Client,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 	clock clock.Clock,
 	options Options,
 ) *Reconciler {
@@ -81,8 +103,9 @@ func NewReconciler(
 	}
 }
 
-// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=scheduledsparkapplications,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=scheduledsparkapplications/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=sparkapplications,verbs=create;list;delete
+// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=scheduledsparkapplications,verbs=get;list;watch
+// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=scheduledsparkapplications/status,verbs=update
 // +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=scheduledsparkapplications/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -135,7 +158,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	schedule, parseErr := cron.ParseStandard(cronSchedule)
 	if parseErr != nil {
-		logger.Error(err, "Failed to parse schedule of ScheduledSparkApplication", "name", scheduledApp.Name, "namespace", scheduledApp.Namespace, "schedule", scheduledApp.Spec.Schedule)
+		logger.Error(parseErr, "Failed to parse schedule of ScheduledSparkApplication", "name", scheduledApp.Name, "namespace", scheduledApp.Namespace, "schedule", scheduledApp.Spec.Schedule)
 		scheduledApp.Status.ScheduleState = v1beta2.ScheduleStateFailedValidation
 		scheduledApp.Status.Reason = parseErr.Error()
 		if updateErr := r.updateScheduledSparkApplicationStatus(ctx, scheduledApp); updateErr != nil {
@@ -145,18 +168,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	switch scheduledApp.Status.ScheduleState {
-	case v1beta2.ScheduleStateNew:
+	case v1beta2.ScheduleStateNew, v1beta2.ScheduleStateFailedValidation:
 		now := r.clock.Now()
 		oldNextRunTime := scheduledApp.Status.NextRun.Time
 		nextRunTime := schedule.Next(now)
-		if oldNextRunTime.IsZero() || nextRunTime.Before(oldNextRunTime) {
+		if oldNextRunTime.IsZero() || nextRunTime.Before(oldNextRunTime) || scheduledApp.Status.ScheduleState == v1beta2.ScheduleStateFailedValidation {
 			scheduledApp.Status.NextRun = metav1.NewTime(nextRunTime)
 		}
 		scheduledApp.Status.ScheduleState = v1beta2.ScheduleStateScheduled
+		scheduledApp.Status.Reason = ""
 		if err := r.updateScheduledSparkApplicationStatus(ctx, scheduledApp); err != nil {
 			return ctrl.Result{Requeue: true}, err
 		}
-		return ctrl.Result{RequeueAfter: nextRunTime.Sub(now)}, err
+		return ctrl.Result{RequeueAfter: nextRunTime.Sub(now)}, nil
 	case v1beta2.ScheduleStateScheduled:
 		now := r.clock.Now()
 		nextRunTime := scheduledApp.Status.NextRun
@@ -197,8 +221,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{Requeue: true}, err
 		}
 		return ctrl.Result{RequeueAfter: schedule.Next(now).Sub(now)}, nil
-	case v1beta2.ScheduleStateFailedValidation:
-		return ctrl.Result{}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -206,14 +228,28 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
+	kind := "ScheduledSparkApplication"
+	name := strings.ToLower(kind)
+
+	// Use a custom log constructor.
+	options.LogConstructor = util.NewLogConstructor(mgr.GetLogger(), kind)
+
+	// Create event filter with error handling
+	eventFilter, err := NewEventFilter(
+		mgr.GetClient(),
+		r.options.Namespaces,
+		r.options.NamespaceSelector,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create scheduled spark application event filter: %v", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
-		Named("scheduled-spark-application-controller").
+		Named(name).
 		Watches(
 			&v1beta2.ScheduledSparkApplication{},
 			NewEventHandler(),
-			builder.WithPredicates(
-				NewEventFilter(r.options.Namespaces),
-			)).
+			builder.WithPredicates(eventFilter)).
 		WithOptions(options).
 		Complete(r)
 }
@@ -238,7 +274,7 @@ func (r *Reconciler) createSparkApplication(
 	}
 	app := &v1beta2.SparkApplication{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-%d", scheduledApp.Name, t.UnixNano()),
+			Name:      fmt.Sprintf("%s-%s", scheduledApp.Name, formatTimestamp(t, r.options.TimestampPrecision)),
 			Namespace: scheduledApp.Namespace,
 			Labels:    labels,
 			OwnerReferences: []metav1.OwnerReference{{
@@ -246,7 +282,7 @@ func (r *Reconciler) createSparkApplication(
 				Kind:               reflect.TypeOf(v1beta2.ScheduledSparkApplication{}).Name(),
 				Name:               scheduledApp.Name,
 				UID:                scheduledApp.UID,
-				BlockOwnerDeletion: util.BoolPtr(true),
+				BlockOwnerDeletion: ptr.To(true),
 			}},
 		},
 		Spec: scheduledApp.Spec.Template,

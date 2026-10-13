@@ -19,11 +19,14 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
@@ -49,15 +52,21 @@ func NewSparkApplicationValidator(client client.Client, enableResourceQuotaEnfor
 	}
 }
 
-var _ admission.CustomValidator = &SparkApplicationValidator{}
+var _ admission.Validator[*v1beta2.SparkApplication] = &SparkApplicationValidator{}
 
-// ValidateCreate implements admission.CustomValidator.
-func (v *SparkApplicationValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
-	app, ok := obj.(*v1beta2.SparkApplication)
-	if !ok {
+// ValidateCreate implements admission.Validator.
+func (v *SparkApplicationValidator) ValidateCreate(ctx context.Context, app *v1beta2.SparkApplication) (warnings admission.Warnings, err error) {
+	if app == nil {
 		return nil, nil
 	}
-	logger.Info("Validating SparkApplication create", "name", app.Name, "namespace", app.Namespace, "state", util.GetApplicationState(app))
+
+	logger := log.FromContext(ctx)
+	logger.Info("Validating SparkApplication create", "state", util.GetApplicationState(app))
+
+	// Validate metadata.name early to prevent downstream Service creation failures
+	if err := v.validateName(app.Name); err != nil {
+		return nil, err
+	}
 	if err := v.validateSpec(ctx, app); err != nil {
 		return nil, err
 	}
@@ -71,19 +80,19 @@ func (v *SparkApplicationValidator) ValidateCreate(ctx context.Context, obj runt
 	return nil, nil
 }
 
-// ValidateUpdate implements admission.CustomValidator.
-func (v *SparkApplicationValidator) ValidateUpdate(ctx context.Context, oldObj runtime.Object, newObj runtime.Object) (warnings admission.Warnings, err error) {
-	oldApp, ok := oldObj.(*v1beta2.SparkApplication)
-	if !ok {
+// ValidateUpdate implements admission.Validator.
+func (v *SparkApplicationValidator) ValidateUpdate(ctx context.Context, oldApp *v1beta2.SparkApplication, newApp *v1beta2.SparkApplication) (warnings admission.Warnings, err error) {
+	if oldApp == nil || newApp == nil {
 		return nil, nil
 	}
 
-	newApp, ok := newObj.(*v1beta2.SparkApplication)
-	if !ok {
-		return nil, nil
-	}
+	logger := log.FromContext(ctx)
+	logger.Info("Validating SparkApplication update", "state", util.GetApplicationState(newApp))
 
-	logger.Info("Validating SparkApplication update", "name", newApp.Name, "namespace", newApp.Namespace)
+	// Name is immutable in Kubernetes, but validate anyway for safety in case of admission reconcilers
+	if err := v.validateName(newApp.Name); err != nil {
+		return nil, err
+	}
 
 	// Skip validating when spec does not change.
 	if equality.Semantic.DeepEqual(oldApp.Spec, newApp.Spec) {
@@ -104,19 +113,18 @@ func (v *SparkApplicationValidator) ValidateUpdate(ctx context.Context, oldObj r
 	return nil, nil
 }
 
-// ValidateDelete implements admission.CustomValidator.
-func (v *SparkApplicationValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
-	app, ok := obj.(*v1beta2.SparkApplication)
-	if !ok {
+// ValidateDelete implements admission.Validator.
+func (v *SparkApplicationValidator) ValidateDelete(ctx context.Context, app *v1beta2.SparkApplication) (warnings admission.Warnings, err error) {
+	if app == nil {
 		return nil, nil
 	}
-	logger.Info("Validating SparkApplication delete", "name", app.Name, "namespace", app.Namespace, "state", util.GetApplicationState(app))
+
+	logger := log.FromContext(ctx)
+	logger.Info("Validating SparkApplication delete", "state", util.GetApplicationState(app))
 	return nil, nil
 }
 
-func (v *SparkApplicationValidator) validateSpec(_ context.Context, app *v1beta2.SparkApplication) error {
-	logger.V(1).Info("Validating SparkApplication spec", "name", app.Name, "namespace", app.Namespace, "state", util.GetApplicationState(app))
-
+func (v *SparkApplicationValidator) validateSpec(ctx context.Context, app *v1beta2.SparkApplication) error {
 	if err := v.validateSparkVersion(app); err != nil {
 		return err
 	}
@@ -145,6 +153,24 @@ func (v *SparkApplicationValidator) validateSpec(_ context.Context, app *v1beta2
 		ingressURLFormats[item.IngressURLFormat] = true
 	}
 
+	if err := validateSparkConf(app.Spec.SparkConf, app.Namespace); err != nil {
+		return err
+	}
+
+	if err := validateConfigMaps(&app.Spec, field.NewPath("spec")); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateName ensures the SparkApplication metadata.name is a valid DNS-1035 label
+// This prevents failures later when creating related resources like Services which
+// require DNS-1035 compliant names.
+func (v *SparkApplicationValidator) validateName(name string) error {
+	if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
+		return fmt.Errorf("invalid SparkApplication name %q: %s", name, strings.Join(errs, ", "))
+	}
 	return nil
 }
 
@@ -159,8 +185,6 @@ func (v *SparkApplicationValidator) validateSparkVersion(app *v1beta2.SparkAppli
 }
 
 func (v *SparkApplicationValidator) validateResourceUsage(ctx context.Context, app *v1beta2.SparkApplication) error {
-	logger.V(1).Info("Validating SparkApplication resource usage", "name", app.Name, "namespace", app.Namespace, "state", util.GetApplicationState(app))
-
 	requests, err := getResourceList(app)
 	if err != nil {
 		return fmt.Errorf("failed to calculate resource quests: %v", err)

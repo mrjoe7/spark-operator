@@ -72,10 +72,21 @@ func (r *Reconciler) createWebUIService(ctx context.Context, app *v1beta2.SparkA
 
 func (r *Reconciler) createWebUIIngress(ctx context.Context, app *v1beta2.SparkApplication, service SparkService, ingressURL *url.URL, ingressClassName string, defaultIngressTLS []networkingv1.IngressTLS, defaultIngressAnnotations map[string]string) (*SparkIngress, error) {
 	ingressName := util.GetDefaultUIIngressName(app)
-	if util.IngressCapabilities.Has("networking.k8s.io/v1") {
-		return r.createDriverIngressV1(ctx, app, service, ingressName, ingressURL, ingressClassName, defaultIngressTLS, defaultIngressAnnotations)
+
+	// Resolve annotations and TLS: per-entry values take precedence, falling back to defaults
+	ingressAnnotations := util.GetWebUIIngressAnnotations(app)
+	if len(ingressAnnotations) == 0 {
+		ingressAnnotations = defaultIngressAnnotations
 	}
-	return r.createDriverIngressLegacy(ctx, app, service, ingressName, ingressURL)
+	ingressTLS := util.GetWebUIIngressTLS(app)
+	if len(ingressTLS) == 0 {
+		ingressTLS = defaultIngressTLS
+	}
+
+	if util.IngressCapabilities.Has("networking.k8s.io/v1") {
+		return r.createDriverIngressV1(ctx, app, service, ingressName, ingressURL, ingressClassName, ingressTLS, ingressAnnotations)
+	}
+	return r.createDriverIngressLegacy(ctx, app, service, ingressName, ingressURL, ingressTLS, ingressAnnotations)
 }
 
 func getWebUIServicePortName(app *v1beta2.SparkApplication) string {
@@ -108,7 +119,7 @@ func getWebUITargetPort(app *v1beta2.SparkApplication) (int32, error) {
 	if !ok {
 		return common.DefaultSparkWebUIPort, nil
 	}
-	port, err := strconv.Atoi(portStr)
+	port, err := strconv.ParseInt(portStr, 10, 32)
 	if err != nil {
 		return common.DefaultSparkWebUIPort, nil
 	}

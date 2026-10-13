@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/validation"
+
 	"github.com/kubeflow/spark-operator/v2/api/v1alpha1"
 	"github.com/kubeflow/spark-operator/v2/pkg/common"
 	"github.com/kubeflow/spark-operator/v2/pkg/util"
@@ -37,11 +39,14 @@ func buildStartConnectServerArgs(conn *v1alpha1.SparkConnect) ([]string, error) 
 		hadoopConfOption,
 		driverConfOption,
 		executorConfOption,
+		gpuConfOption,
 		executorPodTemplateOption,
 		dynamicAllocationOption,
 	}
 
-	args := []string{"${SPARK_HOME}/sbin/start-connect-server.sh"}
+	// The server script path is part of the container entrypoint, so the
+	// arguments built here contain only the options passed to that script.
+	var args []string
 
 	for _, optionFunc := range optionFuncs {
 		option, err := optionFunc(conn)
@@ -83,18 +88,20 @@ func imageOption(conn *v1alpha1.SparkConnect) ([]string, error) {
 	}
 
 	template := conn.Spec.Executor.Template
-	if len(template.Spec.Containers) != 0 {
-		index := 0
-		for i, container := range conn.Spec.Executor.Template.Spec.Containers {
-			if container.Name == common.Spark3DefaultExecutorContainerName {
-				index = i
-				break
-			}
-		}
+	if template != nil && len(template.Spec.Containers) != 0 {
 
-		if template.Spec.Containers[index].Image != "" {
-			executorImage = template.Spec.Containers[index].Image
+		container := util.GetContainerByNameOrFirst(
+			template.Spec.Containers,
+			common.Spark3DefaultExecutorContainerName,
+		)
+
+		if container.Image != "" {
+			executorImage = container.Image
 		}
+	}
+
+	if executorImage == "" {
+		return nil, fmt.Errorf("image is not specified")
 	}
 
 	args = append(
@@ -135,7 +142,7 @@ func hadoopConfOption(conn *v1alpha1.SparkConnect) ([]string, error) {
 		} else {
 			// Add prefix to the configuration key if it does not start with `spark.hadoop.`.
 			// Users will be able to use the configuration key with or without prefix.
-			args = append(args, "--conf", fmt.Sprintf("%s%s=%s", common.SparkHadoopPropertiesPrefix, key, value))
+			args = append(args, "--conf", fmt.Sprintf("%s=%s", common.SparkHadoopPropertiesPrefix+key, value))
 		}
 	}
 	return args, nil
@@ -170,8 +177,11 @@ func driverConfOption(conn *v1alpha1.SparkConnect) ([]string, error) {
 	}
 
 	args = append(args, "--conf", "spark.driver.bindAddress=0.0.0.0")
-	args = append(args, "--conf", "spark.driver.host=${POD_IP}")
+
+	// Property "spark.driver.host" is appended by the container entrypoint, which
+	// resolves POD_IP at runtime and wraps IPv6 addresses in brackets.
 	args = append(args, "--conf", "spark.driver.port=7078")
+	args = append(args, "--conf", "spark.driver.blockManager.port=7079")
 
 	// Driver pod name
 	args = append(args, "--conf", fmt.Sprintf("%s=%s", common.SparkKubernetesDriverPodName, fmt.Sprintf("%s-server", conn.Name)))
@@ -219,6 +229,34 @@ func executorConfOption(conn *v1alpha1.SparkConnect) ([]string, error) {
 	// Use SparkConnect object name as executor pod name prefix.
 	args = append(args, "--conf", fmt.Sprintf("%s=%s", common.SparkKubernetesExecutorPodNamePrefix, conn.Name))
 
+	return args, nil
+}
+
+// gpuConfOption configures Spark's resource scheduler in addition to pod resources.
+func gpuConfOption(conn *v1alpha1.SparkConnect) ([]string, error) {
+	var args []string
+	for _, role := range []struct {
+		name string
+		gpu  *v1alpha1.GPUSpec
+	}{
+		{name: "driver", gpu: conn.Spec.Server.GPU},
+		{name: "executor", gpu: conn.Spec.Executor.GPU},
+	} {
+		if role.gpu == nil {
+			continue
+		}
+		vendor, name, ok := strings.Cut(role.gpu.Name, "/")
+		if !ok || name != "gpu" || len(validation.IsDNS1123Subdomain(vendor)) != 0 {
+			return nil, fmt.Errorf("%s GPU resource name must have the form <vendor-domain>/gpu, got %q", role.name, role.gpu.Name)
+		}
+		if role.gpu.Quantity <= 0 {
+			return nil, fmt.Errorf("%s GPU quantity must be positive, got %d", role.name, role.gpu.Quantity)
+		}
+		args = append(args,
+			"--conf", fmt.Sprintf("spark.%s.resource.gpu.amount=%d", role.name, role.gpu.Quantity),
+			"--conf", fmt.Sprintf("spark.%s.resource.gpu.vendor=%s", role.name, vendor),
+		)
+	}
 	return args, nil
 }
 

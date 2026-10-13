@@ -21,25 +21,26 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
-
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -56,6 +57,7 @@ import (
 // Options defines the options of the controller.
 type Options struct {
 	Namespaces            []string
+	NamespaceSelector     string
 	EnableUIService       bool
 	IngressClassName      string
 	IngressURLFormat      string
@@ -71,6 +73,20 @@ type Options struct {
 	SparkExecutorMetrics    *metrics.SparkExecutorMetrics
 
 	MaxTrackedExecutorPerApp int
+
+	// EnableDriverPDB gates creation of a PodDisruptionBudget for the driver pod.
+	// When false, the reconciler will not create or delete a PDB regardless of
+	// the SparkApplication spec. Defaults to false.
+	EnableDriverPDB bool
+
+	// DefaultTimeToLiveSeconds is the normalized operator-wide default TTL (in seconds)
+	// applied to terminated SparkApplications that do not set spec.timeToLiveSeconds when
+	// the value is > 0. It is a cleanup-only fallback and never modifies the spec.
+	DefaultTimeToLiveSeconds int64
+
+	// DefaultServiceAccount is the name of the service account used by the driver pod
+	// when the SparkApplication does not specify one. An empty value disables the fallback.
+	DefaultServiceAccount string
 }
 
 // Reconciler reconciles a SparkApplication object.
@@ -78,7 +94,7 @@ type Reconciler struct {
 	manager   ctrl.Manager
 	scheme    *runtime.Scheme
 	client    client.Client
-	recorder  record.EventRecorder
+	recorder  events.EventRecorder
 	registry  *scheduler.Registry
 	submitter SparkApplicationSubmitter
 	options   Options
@@ -92,7 +108,7 @@ func NewReconciler(
 	manager ctrl.Manager,
 	scheme *runtime.Scheme,
 	client client.Client,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 	registry *scheduler.Registry,
 	submitter SparkApplicationSubmitter,
 	options Options,
@@ -108,18 +124,17 @@ func NewReconciler(
 	}
 }
 
-// +kubebuilder:rbac:groups=,resources=pods,verbs=get;list;watch;create;update;patch;delete;deletecollection
-// +kubebuilder:rbac:groups=,resources=configmaps,verbs=get;list;create;update;patch;delete
-// +kubebuilder:rbac:groups=,resources=services,verbs=get;create;delete
-// +kubebuilder:rbac:groups=,resources=nodes,verbs=get
-// +kubebuilder:rbac:groups=,resources=events,verbs=create;update;patch
-// +kubebuilder:rbac:groups=,resources=resourcequotas,verbs=get;list;watch
-// +kubebuilder:rbac:groups=extensions,resources=ingresses,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;update;patch
+// +kubebuilder:rbac:groups=extensions,resources=ingresses,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get
-// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=sparkapplications,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=sparkapplications/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=sparkapplications,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=sparkapplications/status,verbs=update
 // +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=sparkapplications/finalizers,verbs=update
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -194,6 +209,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	logger.Info("Reconciling SparkApplication", "state", app.Status.AppState.State)
 	defer logger.Info("Finished reconciling SparkApplication")
 
+	if app.Spec.ManagedBy != nil && *app.Spec.ManagedBy != common.SparkOperatorManagerName {
+		logger.Info(
+			"Skipping reconciliation: managed by external controller",
+			"managedBy", *app.Spec.ManagedBy,
+		)
+		return ctrl.Result{}, nil
+	}
+
 	// Check if the spark application is being deleted
 	if !app.DeletionTimestamp.IsZero() {
 		return r.handleSparkApplicationDeletion(ctx, req)
@@ -242,24 +265,61 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		Named("spark-application-controller").
+	kind := "SparkApplication"
+	name := strings.ToLower(kind)
+
+	// Use a custom log constructor.
+	options.LogConstructor = util.NewLogConstructor(mgr.GetLogger(), kind)
+
+	// Create event filters with error handling
+	podEventFilter, err := newSparkPodEventFilter(
+		mgr.GetClient(),
+		r.options.Namespaces,
+		r.options.NamespaceSelector,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create spark pod event filter: %v", err)
+	}
+
+	appEventFilter, err := NewSparkApplicationEventFilter(
+		mgr.GetClient(),
+		mgr.GetEventRecorder("spark-application-event-handler"),
+		r.options.Namespaces,
+		r.options.NamespaceSelector,
+		r.options.DefaultTimeToLiveSeconds,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create spark application event filter: %v", err)
+	}
+
+	ctrlBuilder := ctrl.NewControllerManagedBy(mgr).
+		Named(name).
 		Watches(
 			&corev1.Pod{},
 			NewSparkPodEventHandler(mgr.GetClient(), r.options.SparkExecutorMetrics),
-			builder.WithPredicates(newSparkPodEventFilter(r.options.Namespaces)),
+			builder.WithPredicates(podEventFilter),
 		).
 		Watches(
 			&v1beta2.SparkApplication{},
 			NewSparkApplicationEventHandler(r.options.SparkApplicationMetrics),
-			builder.WithPredicates(
-				NewSparkApplicationEventFilter(
-					mgr.GetClient(),
-					mgr.GetEventRecorderFor("spark-application-event-handler"),
-					r.options.Namespaces,
-				),
+			builder.WithPredicates(appEventFilter),
+		)
+
+	// Watch owned driver PDBs so an edit/delete re-enqueues the owning
+	// SparkApplication. Only wired when the feature is on.
+	if r.options.EnableDriverPDB {
+		ctrlBuilder = ctrlBuilder.Watches(
+			&policyv1.PodDisruptionBudget{},
+			handler.EnqueueRequestForOwner(
+				mgr.GetScheme(),
+				mgr.GetRESTMapper(),
+				&v1beta2.SparkApplication{},
+				handler.OnlyControllerOwner(),
 			),
-		).
+		)
+	}
+
+	return ctrlBuilder.
 		WithOptions(options).
 		Complete(r)
 }
@@ -330,6 +390,13 @@ func (r *Reconciler) reconcileSubmittedSparkApplication(ctx context.Context, req
 				return err
 			}
 
+			// Converge the driver PDB to spec on every Submitted-state pass.
+			// Bubbles up so controller-runtime backoff retries transient
+			// API failures.
+			if err := r.ensureDriverPDB(ctx, app); err != nil {
+				return fmt.Errorf("failed to ensure driver PDB: %v", err)
+			}
+
 			// Create web UI service for spark applications if enabled.
 			if r.options.EnableUIService {
 				service, err := r.createWebUIService(ctx, app)
@@ -368,7 +435,7 @@ func (r *Reconciler) reconcileSubmittedSparkApplication(ctx context.Context, req
 					if err != nil {
 						return fmt.Errorf("failed to get driver ingress url: %v", err)
 					}
-					_, err = r.createDriverIngress(ctx, app, &driverIngressConfiguration, *service, ingressURL, r.options.IngressClassName)
+					_, err = r.createDriverIngress(ctx, app, &driverIngressConfiguration, *service, ingressURL, r.options.IngressClassName, r.options.IngressTLS, r.options.IngressAnnotations)
 					if err != nil {
 						return fmt.Errorf("failed to create driver ingress: %v", err)
 					}
@@ -463,6 +530,14 @@ func (r *Reconciler) reconcileRunningSparkApplication(ctx context.Context, req c
 				return err
 			}
 
+			// Converge the driver PDB to spec on every Running-state pass.
+			// Recovers PDBs missed because the operator was restarted with
+			// the gate flipped on after the app was already submitted, and
+			// picks up live spec flips on running apps.
+			if err := r.ensureDriverPDB(ctx, app); err != nil {
+				return fmt.Errorf("failed to ensure driver PDB: %v", err)
+			}
+
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
 			}
@@ -496,8 +571,9 @@ func (r *Reconciler) reconcilePendingRerunSparkApplication(ctx context.Context, 
 			if r.validateSparkResourceDeletion(ctx, app) {
 				logger.Info("Successfully deleted resources associated with SparkApplication", "state", app.Status.AppState.State)
 				r.recordSparkApplicationEvent(app)
-				r.resetSparkApplicationStatus(app)
 				r.submitSparkApplication(ctx, app)
+			} else {
+				logger.Info("Resources associated with SparkApplication still exist")
 			}
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
@@ -567,6 +643,7 @@ func (r *Reconciler) reconcileSucceedingSparkApplication(ctx context.Context, re
 					logger.Error(err, "failed to delete spark resources")
 					return err
 				}
+				r.resetSparkApplicationStatus(app)
 				app.Status.AppState.State = v1beta2.ApplicationStatePendingRerun
 			} else {
 				app.Status.AppState.State = v1beta2.ApplicationStateCompleted
@@ -612,6 +689,7 @@ func (r *Reconciler) reconcileFailingSparkApplication(ctx context.Context, req c
 						logger.Error(err, "failed to delete spark resources")
 						return err
 					}
+					r.resetSparkApplicationStatus(app)
 					app.Status.AppState.State = v1beta2.ApplicationStatePendingRerun
 				} else {
 					// If we're waiting before retrying then reconcile will not modify anything, so we need to requeue.
@@ -654,8 +732,15 @@ func (r *Reconciler) reconcileTerminatedSparkApplication(ctx context.Context, re
 		return ctrl.Result{}, nil
 	}
 
-	if util.IsExpired(app) {
-		logger.Info("Deleting expired SparkApplication", "state", app.Status.AppState.State)
+	effectiveTTLSeconds, usedDefault := util.EffectiveTimeToLiveSeconds(app, r.options.DefaultTimeToLiveSeconds)
+
+	if util.IsExpired(app, effectiveTTLSeconds) {
+		if usedDefault {
+			logger.Info("Deleting expired SparkApplication using operator default TTL",
+				"ttlSeconds", *effectiveTTLSeconds, "state", app.Status.AppState.State)
+		} else {
+			logger.Info("Deleting expired SparkApplication", "state", app.Status.AppState.State)
+		}
 		if err := r.client.Delete(ctx, app); err != nil {
 			return ctrl.Result{Requeue: true}, err
 		}
@@ -675,14 +760,14 @@ func (r *Reconciler) reconcileTerminatedSparkApplication(ctx context.Context, re
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	// If termination time or TTL is not set, will not requeue this application.
-	if app.Status.TerminationTime.IsZero() || app.Spec.TimeToLiveSeconds == nil || *app.Spec.TimeToLiveSeconds <= 0 {
+	// If termination time or effective TTL is not set, will not requeue this application.
+	if app.Status.TerminationTime.IsZero() || effectiveTTLSeconds == nil || *effectiveTTLSeconds <= 0 {
 		return ctrl.Result{}, nil
 	}
 
 	// Otherwise, requeue the application for subsequent deletion.
 	now := time.Now()
-	ttl := time.Duration(*app.Spec.TimeToLiveSeconds) * time.Second
+	ttl := time.Duration(*effectiveTTLSeconds) * time.Second
 	survival := now.Sub(app.Status.TerminationTime.Time)
 
 	// If survival time is greater than TTL, requeue the application immediately.
@@ -742,7 +827,7 @@ func (r *Reconciler) reconcileSuspendingSparkApplication(ctx context.Context, re
 			r.recordSparkApplicationEvent(app)
 
 			if err := r.deleteSparkResources(ctx, app); err != nil {
-				logger.Error(err, "failed to delete spark resources", "name", app.Name, "namespace", app.Namespace)
+				logger.Error(err, "failed to delete spark resources")
 				return err
 			}
 
@@ -758,7 +843,7 @@ func (r *Reconciler) reconcileSuspendingSparkApplication(ctx context.Context, re
 		},
 	)
 	if retryErr != nil {
-		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
+		logger.Error(retryErr, "Failed to reconcile SparkApplication")
 		return ctrl.Result{}, retryErr
 	}
 	return ctrl.Result{}, nil
@@ -780,7 +865,7 @@ func (r *Reconciler) reconcileSuspendedSparkApplication(ctx context.Context, req
 			app := old.DeepCopy()
 
 			if r.validateSparkResourceDeletion(ctx, app) {
-				logger.Info("Successfully deleted resources associated with SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
+				logger.Info("Successfully deleted resources associated with SparkApplication", "state", app.Status.AppState.State)
 				r.resetSparkApplicationStatus(app)
 				r.recordSparkApplicationEvent(app)
 				if !ptr.Deref(app.Spec.Suspend, false) {
@@ -789,9 +874,7 @@ func (r *Reconciler) reconcileSuspendedSparkApplication(ctx context.Context, req
 					}
 				}
 			} else {
-				err := fmt.Errorf("resources associated with SparkApplication still exist: %s/%s", app.Namespace, app.Name)
-				logger.Error(err, "Failed to confirm being deleted resources associated with SparkApplication", "name", app.Name, "namespace", app.Namespace, "state", app.Status.AppState.State)
-				return err
+				logger.Info("Resources associated with SparkApplication still exist")
 			}
 			if err := r.updateSparkApplicationStatus(ctx, app); err != nil {
 				return err
@@ -800,7 +883,7 @@ func (r *Reconciler) reconcileSuspendedSparkApplication(ctx context.Context, req
 		},
 	)
 	if retryErr != nil {
-		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
+		logger.Error(retryErr, "Failed to reconcile SparkApplication")
 		return ctrl.Result{}, retryErr
 	}
 	return ctrl.Result{}, nil
@@ -831,7 +914,7 @@ func (r *Reconciler) reconcileResumingSparkApplication(ctx context.Context, req 
 		},
 	)
 	if retryErr != nil {
-		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
+		logger.Error(retryErr, "Failed to reconcile SparkApplication")
 		return ctrl.Result{Requeue: true}, retryErr
 	}
 	return ctrl.Result{}, nil
@@ -858,7 +941,7 @@ func (r *Reconciler) transitionToSuspending(ctx context.Context, req ctrl.Reques
 		},
 	)
 	if retryErr != nil {
-		logger.Error(retryErr, "Failed to reconcile SparkApplication", "name", key.Name, "namespace", key.Namespace)
+		logger.Error(retryErr, "Failed to reconcile SparkApplication")
 		return ctrl.Result{Requeue: true}, retryErr
 	}
 	return ctrl.Result{}, nil
@@ -916,7 +999,10 @@ func (r *Reconciler) submitSparkApplication(ctx context.Context, app *v1beta2.Sp
 	}
 
 	// Use batch scheduler to perform scheduling task before submitting (before build command arguments).
-	if needScheduling, scheduler := r.shouldDoBatchScheduling(ctx, app); needScheduling {
+	if needScheduling, scheduler, err := r.shouldDoBatchScheduling(ctx, app); err != nil {
+		submitErr = fmt.Errorf("failed during batch scheduler setup or check: %v", err)
+		return
+	} else if needScheduling {
 		logger.Info("Do batch scheduling for SparkApplication")
 		if err := scheduler.Schedule(app); err != nil {
 			submitErr = fmt.Errorf("failed to process batch scheduler: %v", err)
@@ -930,11 +1016,25 @@ func (r *Reconciler) submitSparkApplication(ctx context.Context, app *v1beta2.Sp
 		}
 	}()
 
-	if err := r.submitter.Submit(ctx, app); err != nil {
+	// Fall back to the operator-level default service account when neither the SparkApplication
+	// nor its driver pod template specifies one. This is applied to a copy of the application so
+	// that the fallback is never written back to the custom resource.
+	submitApp := util.ApplyDefaultDriverServiceAccount(app, r.options.DefaultServiceAccount)
+	if submitApp != app {
+		logger.Info("Applied default driver service account", "serviceAccount", r.options.DefaultServiceAccount)
+	}
+
+	if err := r.submitter.Submit(ctx, submitApp); err != nil {
 		r.recordSparkApplicationEvent(app)
 		submitErr = fmt.Errorf("failed to submit spark application: %v", err)
 		return
 	}
+
+	// Driver PDB creation lives in the Submitted/Running reconcile loops via
+	// ensureDriverPDB. Doing it here would couple PDB-create errors to the
+	// submit-or-FailedSubmission state machine - the deferred above flips the
+	// app to FailedSubmission on any non-nil submitErr, which would corrupt
+	// the state of an already-running app if the post-submit PDB call failed.
 }
 
 // updateDriverState finds the driver pod of the application
@@ -952,6 +1052,28 @@ func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkAp
 
 	if driverPod == nil {
 		if app.Status.AppState.State != v1beta2.ApplicationStateSubmitted || metav1.Now().Sub(app.Status.LastSubmissionAttemptTime.Time) > r.options.DriverPodCreationGracePeriod {
+			r.recorder.Eventf(
+				app,
+				nil,
+				corev1.EventTypeWarning,
+				common.EventSparkDriverNotFound,
+				"Driver pod %s not found after grace period %v, marking application as Failing",
+				app.Status.DriverInfo.PodName,
+				r.options.DriverPodCreationGracePeriod,
+			)
+			logger := log.FromContext(ctx)
+			if app.Status.AppState.State == v1beta2.ApplicationStateSubmitted {
+				logger.Info("Driver pod not found after creation grace period; marking SparkApplication as Failing",
+					"driverPodName", app.Status.DriverInfo.PodName,
+					"lastSubmissionAttemptTime", app.Status.LastSubmissionAttemptTime,
+					"gracePeriod", r.options.DriverPodCreationGracePeriod,
+				)
+			} else {
+				logger.Info("Driver pod not found; marking SparkApplication as Failing",
+					"driverPodName", app.Status.DriverInfo.PodName,
+					"previousState", app.Status.AppState.State,
+				)
+			}
 			app.Status.AppState.State = v1beta2.ApplicationStateFailing
 			app.Status.AppState.ErrorMessage = "driver pod not found"
 			app.Status.TerminationTime = metav1.Now()
@@ -990,6 +1112,7 @@ func (r *Reconciler) updateDriverState(ctx context.Context, app *v1beta2.SparkAp
 // updateExecutorState lists the executor pods of the application
 // and updates the executor state based on the current phase of the pods.
 func (r *Reconciler) updateExecutorState(ctx context.Context, app *v1beta2.SparkApplication) error {
+	logger := log.FromContext(ctx)
 	podList, err := r.getExecutorPods(ctx, app)
 	if err != nil {
 		return err
@@ -1053,7 +1176,7 @@ func (r *Reconciler) updateExecutorState(ctx context.Context, app *v1beta2.Spark
 				if app.Status.AppState.State == v1beta2.ApplicationStateCompleted {
 					app.Status.ExecutorState[name] = v1beta2.ExecutorStateCompleted
 				} else {
-					glog.Infof("Executor pod %s not found, assuming it was deleted.", name)
+					logger.Info("Executor pod not found, assuming it was deleted", "name", name)
 					app.Status.ExecutorState[name] = v1beta2.ExecutorStateFailed
 				}
 			} else {
@@ -1113,6 +1236,11 @@ func (r *Reconciler) updateSparkApplicationStatus(ctx context.Context, app *v1be
 
 // Delete the resources associated with the spark application.
 func (r *Reconciler) deleteSparkResources(ctx context.Context, app *v1beta2.SparkApplication) error {
+	// Drop the driver PDB first so an in-flight `kubectl drain` does not block on an orphaned PDB whose target pod is gone.
+	if err := r.deleteDriverPDB(ctx, app); err != nil {
+		return err
+	}
+
 	if err := r.deleteDriverPod(ctx, app); err != nil {
 		return err
 	}
@@ -1169,7 +1297,7 @@ func (r *Reconciler) deleteWebUIService(ctx context.Context, app *v1beta2.SparkA
 			},
 		},
 		&client.DeleteOptions{
-			GracePeriodSeconds: util.Int64Ptr(0),
+			GracePeriodSeconds: ptr.To[int64](0),
 		},
 	); err != nil && !errors.IsNotFound(err) {
 		return err
@@ -1195,7 +1323,7 @@ func (r *Reconciler) deleteWebUIIngress(ctx context.Context, app *v1beta2.SparkA
 				},
 			},
 			&client.DeleteOptions{
-				GracePeriodSeconds: util.Int64Ptr(0),
+				GracePeriodSeconds: ptr.To[int64](0),
 			},
 		); err != nil && !errors.IsNotFound(err) {
 			return err
@@ -1213,7 +1341,7 @@ func (r *Reconciler) deleteWebUIIngress(ctx context.Context, app *v1beta2.SparkA
 				},
 			},
 			&client.DeleteOptions{
-				GracePeriodSeconds: util.Int64Ptr(0),
+				GracePeriodSeconds: ptr.To[int64](0),
 			},
 		); err != nil && !errors.IsNotFound(err) {
 			return err
@@ -1260,6 +1388,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStateNew:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeNormal,
 			common.EventSparkApplicationAdded,
 			"SparkApplication %s was added, enqueuing it for submission",
@@ -1268,6 +1397,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStateSubmitted:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeNormal,
 			common.EventSparkApplicationSubmitted,
 			"SparkApplication %s was submitted successfully",
@@ -1276,6 +1406,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStateFailedSubmission:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeWarning,
 			common.EventSparkApplicationSubmissionFailed,
 			"failed to submit SparkApplication %s: %s",
@@ -1285,6 +1416,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStateCompleted:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeNormal,
 			common.EventSparkApplicationCompleted,
 			"SparkApplication %s completed",
@@ -1293,6 +1425,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStateFailed:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeWarning,
 			common.EventSparkApplicationFailed,
 			"SparkApplication %s failed: %s",
@@ -1302,6 +1435,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStatePendingRerun:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeWarning,
 			common.EventSparkApplicationPendingRerun,
 			"SparkApplication %s is pending rerun",
@@ -1310,6 +1444,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStateSuspending:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeWarning,
 			common.EventSparkApplicationSuspending,
 			"SparkApplication %s is suspending",
@@ -1318,6 +1453,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStateSuspended:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeWarning,
 			common.EventSparkApplicationSuspended,
 			"SparkApplication %s is suspended",
@@ -1326,6 +1462,7 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 	case v1beta2.ApplicationStateResuming:
 		r.recorder.Eventf(
 			app,
+			nil,
 			corev1.EventTypeWarning,
 			common.EventSparkApplicationResuming,
 			"SparkApplication %s is resuming",
@@ -1337,36 +1474,42 @@ func (r *Reconciler) recordSparkApplicationEvent(app *v1beta2.SparkApplication) 
 func (r *Reconciler) recordDriverEvent(app *v1beta2.SparkApplication, state v1beta2.DriverState, name string) {
 	switch state {
 	case v1beta2.DriverStatePending:
-		r.recorder.Eventf(app, corev1.EventTypeNormal, common.EventSparkDriverPending, "Driver %s is pending", name)
+		r.recorder.Eventf(app, nil, corev1.EventTypeNormal, common.EventSparkDriverPending, "Driver %s is pending", name)
 	case v1beta2.DriverStateRunning:
-		r.recorder.Eventf(app, corev1.EventTypeNormal, common.EventSparkDriverRunning, "Driver %s is running", name)
+		r.recorder.Eventf(app, nil, corev1.EventTypeNormal, common.EventSparkDriverRunning, "Driver %s is running", name)
 	case v1beta2.DriverStateCompleted:
-		r.recorder.Eventf(app, corev1.EventTypeNormal, common.EventSparkDriverCompleted, "Driver %s completed", name)
+		r.recorder.Eventf(app, nil, corev1.EventTypeNormal, common.EventSparkDriverCompleted, "Driver %s completed", name)
 	case v1beta2.DriverStateFailed:
-		r.recorder.Eventf(app, corev1.EventTypeWarning, common.EventSparkDriverFailed, "Driver %s failed", name)
+		r.recorder.Eventf(app, nil, corev1.EventTypeWarning, common.EventSparkDriverFailed, "Driver %s failed", name)
 	case v1beta2.DriverStateUnknown:
-		r.recorder.Eventf(app, corev1.EventTypeWarning, common.EventSparkDriverUnknown, "Driver %s in unknown state", name)
+		r.recorder.Eventf(app, nil, corev1.EventTypeWarning, common.EventSparkDriverUnknown, "Driver %s in unknown state", name)
 	}
 }
 
 func (r *Reconciler) recordExecutorEvent(app *v1beta2.SparkApplication, state v1beta2.ExecutorState, args ...any) {
 	switch state {
 	case v1beta2.ExecutorStatePending:
-		r.recorder.Eventf(app, corev1.EventTypeNormal, common.EventSparkExecutorPending, "Executor %s is pending", args...)
+		r.recorder.Eventf(app, nil, corev1.EventTypeNormal, common.EventSparkExecutorPending, "Executor %s is pending", app.Name, args...)
 	case v1beta2.ExecutorStateRunning:
-		r.recorder.Eventf(app, corev1.EventTypeNormal, common.EventSparkExecutorRunning, "Executor %s is running", args...)
+		r.recorder.Eventf(app, nil, corev1.EventTypeNormal, common.EventSparkExecutorRunning, "Executor %s is running", app.Name, args...)
 	case v1beta2.ExecutorStateCompleted:
-		r.recorder.Eventf(app, corev1.EventTypeNormal, common.EventSparkExecutorCompleted, "Executor %s completed", args...)
+		r.recorder.Eventf(app, nil, corev1.EventTypeNormal, common.EventSparkExecutorCompleted, "Executor %s completed", app.Name, args...)
 	case v1beta2.ExecutorStateFailed:
-		r.recorder.Eventf(app, corev1.EventTypeWarning, common.EventSparkExecutorFailed, "Executor %s failed with ExitCode: %d, Reason: %s, Pod Message: %s", args...)
+		r.recorder.Eventf(app, nil, corev1.EventTypeWarning, common.EventSparkExecutorFailed, "Executor %s failed with ExitCode: %d, Reason: %s, Pod Message: %s", app.Name, args...)
 	case v1beta2.ExecutorStateUnknown:
-		r.recorder.Eventf(app, corev1.EventTypeWarning, common.EventSparkExecutorUnknown, "Executor %s in unknown state", args...)
+		r.recorder.Eventf(app, nil, corev1.EventTypeWarning, common.EventSparkExecutorUnknown, "Executor %s in unknown state", app.Name, args...)
 	}
 }
 
 func (r *Reconciler) resetSparkApplicationStatus(app *v1beta2.SparkApplication) {
 	status := &app.Status
 	switch status.AppState.State {
+	case v1beta2.ApplicationStateSucceeding, v1beta2.ApplicationStateFailing:
+		status.SparkApplicationID = ""
+		status.TerminationTime = metav1.Time{}
+		status.AppState.ErrorMessage = ""
+		status.DriverInfo = v1beta2.DriverInfo{}
+		status.ExecutorState = nil
 	case v1beta2.ApplicationStateInvalidating:
 		status.SparkApplicationID = ""
 		status.SubmissionAttempts = 0
@@ -1374,13 +1517,7 @@ func (r *Reconciler) resetSparkApplicationStatus(app *v1beta2.SparkApplication) 
 		status.LastSubmissionAttemptTime = metav1.Time{}
 		status.TerminationTime = metav1.Time{}
 		status.AppState.ErrorMessage = ""
-		status.ExecutorState = nil
-	case v1beta2.ApplicationStatePendingRerun:
-		status.SparkApplicationID = ""
-		status.SubmissionAttempts = 0
-		status.LastSubmissionAttemptTime = metav1.Time{}
 		status.DriverInfo = v1beta2.DriverInfo{}
-		status.AppState.ErrorMessage = ""
 		status.ExecutorState = nil
 	case v1beta2.ApplicationStateSuspended:
 		status.SparkApplicationID = ""
@@ -1390,11 +1527,10 @@ func (r *Reconciler) resetSparkApplicationStatus(app *v1beta2.SparkApplication) 
 	}
 }
 
-func (r *Reconciler) shouldDoBatchScheduling(ctx context.Context, app *v1beta2.SparkApplication) (bool, scheduler.Interface) {
-	logger := log.FromContext(ctx)
+func (r *Reconciler) shouldDoBatchScheduling(ctx context.Context, app *v1beta2.SparkApplication) (bool, scheduler.Interface, error) {
 	// If batch scheduling isn't enabled
 	if r.registry == nil {
-		return false, nil
+		return false, nil, nil
 	}
 
 	schedulerName := r.options.DefaultBatchScheduler
@@ -1404,7 +1540,7 @@ func (r *Reconciler) shouldDoBatchScheduling(ctx context.Context, app *v1beta2.S
 
 	// If both the default and app batch scheduler are unspecified or empty
 	if schedulerName == "" {
-		return false, nil
+		return false, nil, nil
 	}
 
 	var err error
@@ -1431,18 +1567,27 @@ func (r *Reconciler) shouldDoBatchScheduling(ctx context.Context, app *v1beta2.S
 	}
 
 	if err != nil || scheduler == nil {
-		logger.Error(err, "Failed to get scheduler for SparkApplication", "scheduler", schedulerName)
-		return false, nil
+		return false, nil, fmt.Errorf("failed to get scheduler %s: %v", schedulerName, err)
 	}
-	return scheduler.ShouldSchedule(app), scheduler
+	return scheduler.ShouldSchedule(app), scheduler, nil
 }
 
 // Clean up when the spark application is terminated.
 func (r *Reconciler) cleanUpOnTermination(ctx context.Context, _, newApp *v1beta2.SparkApplication) error {
-	if needScheduling, scheduler := r.shouldDoBatchScheduling(ctx, newApp); needScheduling {
+	if needScheduling, scheduler, _ := r.shouldDoBatchScheduling(ctx, newApp); needScheduling {
 		if err := scheduler.Cleanup(newApp); err != nil {
 			return err
 		}
+	}
+	// The driver PDB no longer protects anything once the app reaches a
+	// terminal state (the driver pod is Succeeded/Failed and ineligible for
+	// disruption). Removing it here also covers the case where the operator
+	// missed the Succeeding/Failing -> terminal transition (e.g. the
+	// controller pod itself was drained), since cleanUpOnTermination runs on
+	// every reconcile of an already-terminal app and deleteDriverPDB is
+	// idempotent.
+	if err := r.deleteDriverPDB(ctx, newApp); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1450,9 +1595,6 @@ func (r *Reconciler) cleanUpOnTermination(ctx context.Context, _, newApp *v1beta
 // cleanUpPodTemplateFiles cleans up the driver and executor pod template files.
 func (r *Reconciler) cleanUpPodTemplateFiles(ctx context.Context, app *v1beta2.SparkApplication) error {
 	logger := log.FromContext(ctx)
-	if app.Spec.Driver.Template == nil && app.Spec.Executor.Template == nil {
-		return nil
-	}
 	path := fmt.Sprintf("/tmp/spark/%s", app.Status.SubmissionID)
 	if err := os.RemoveAll(path); err != nil {
 		if !os.IsNotExist(err) {

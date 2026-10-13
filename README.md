@@ -1,7 +1,6 @@
 # Kubeflow Spark Operator
 
 [![GitHub release](https://img.shields.io/github/v/release/kubeflow/spark-operator)](https://github.com/kubeflow/spark-operator/releases)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kubeflow/spark-operator)](https://goreportcard.com/report/github.com/kubeflow/spark-operator)
 [![Integration Test](https://github.com/kubeflow/spark-operator/actions/workflows/integration.yaml/badge.svg)](https://github.com/kubeflow/spark-operator/actions/workflows/integration.yaml)
 [![Join Slack](https://img.shields.io/badge/Join_Slack-blue?logo=slack)](https://www.kubeflow.org/docs/about/community/#kubeflow-slack-channels)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kubeflow/spark-operator)
@@ -16,7 +15,9 @@ The Kubernetes Operator for Apache Spark aims to make specifying and running [Sp
 
 ## Quick Start
 
-For a more detailed guide, please refer to the [Getting Started guide](https://www.kubeflow.org/docs/components/spark-operator/getting-started/).
+For a more detailed guide, please refer to the [Getting Started guide](https://spark.kubeflow.org/en/latest/getting-started/).
+
+### Installation with Helm
 
 ```bash
 # Add the Helm repository
@@ -38,9 +39,32 @@ kubectl get sparkapp spark-pi
 kubectl delete sparkapp spark-pi
 ```
 
+### Installation with Kustomize
+
+An alternative install method is using kustomize manifests.
+For more information go to the [kustomize installation docs](docs/kustomize-installation.md).
+
+```bash
+git clone https://github.com/kubeflow/spark-operator.git && cd spark-operator
+kubectl apply -k config/default --server-side --force-conflicts
+
+# If you use kustomize to install, also install Spark application RBAC in the namespace where you will run Spark applications. 
+# The example below runs in the default namespace and uses the spark-operator-spark service account.
+kubectl -n default apply -k config/spark-rbac
+
+# Create an example application in the default namespace
+kubectl apply -f https://raw.githubusercontent.com/kubeflow/spark-operator/refs/heads/master/examples/spark-pi.yaml
+
+# Get the status of the application
+kubectl get sparkapp spark-pi
+
+# Delete the application
+kubectl delete sparkapp spark-pi
+```
+
 ## Overview
 
-For a complete reference of the custom resource definitions, please refer to the [API Definition](docs/api-docs.md). For details on its design, please refer to the [Architecture](https://www.kubeflow.org/docs/components/spark-operator/overview/#architecture). It requires Spark 2.3 and above that supports Kubernetes as a native scheduler backend.
+For a complete reference of the custom resource definitions, please refer to the [API Definition](docs/api-docs.md). For details on its design, please refer to the [Architecture](https://spark.kubeflow.org/en/latest/overview/#architecture). It requires Spark 2.3 and above that supports Kubernetes as a native scheduler backend.
 
 The Kubernetes Operator for Apache Spark currently supports the following list of features:
 
@@ -70,15 +94,15 @@ The Kubernetes Operator for Apache Spark currently supports the following list o
 
 ## Getting Started
 
-For getting started with Spark operator, please refer to [Getting Started](https://www.kubeflow.org/docs/components/spark-operator/getting-started/).
+For getting started with Spark operator, please refer to [Getting Started](https://spark.kubeflow.org/en/latest/getting-started/).
 
 ## User Guide
 
-For detailed user guide and API documentation, please refer to [User Guide](https://www.kubeflow.org/docs/components/spark-operator/user-guide/) and [API Specification](docs/api-docs.md).
+For detailed user guide and API documentation, please refer to [User Guide](https://spark.kubeflow.org/en/latest/user-guide/) and [API Specification](docs/api-docs.md).
 
 If you plan to run Spark workloads with Spark operator on [Alibaba Cloud Container Service for Kubernetes (ACK)](https://www.alibabacloud.com/product/kubernetes), also refer to the [ACK guide](https://www.alibabacloud.com/help/ack/ack-managed-and-ack-dedicated/use-cases/run-apache-spark-workloads-on-ack) for optimized configuration practices.
 
-If you are running Spark operator on Google Kubernetes Engine (GKE) and want to use Google Cloud Storage (GCS) and/or BigQuery for reading/writing data, also refer to the [GCP guide](https://www.kubeflow.org/docs/components/spark-operator/user-guide/gcp/).
+If you are running Spark operator on Google Kubernetes Engine (GKE) and want to use Google Cloud Storage (GCS) and/or BigQuery for reading/writing data, also refer to the [GCP guide](https://spark.kubeflow.org/en/latest/user-guide/gcp.html).
 
 ## Blog Posts
 
@@ -108,7 +132,7 @@ The following table lists the most recent few versions of the operator.
 
 ## Developer Guide
 
-For developing with Spark Operator, please refer to [Developer Guide](https://www.kubeflow.org/docs/components/spark-operator/developer-guide/).
+For developing with Spark Operator, please refer to [Developer Guide](https://spark.kubeflow.org/en/latest/contributor-guide/).
 
 ## Contributor Guide
 
@@ -116,7 +140,7 @@ For contributing to Spark Operator, please refer to [Contributor Guide](CONTRIBU
 
 ## Community
 
-- Join the [CNCF Slack Channel](https://www.kubeflow.org/docs/about/community/#kubeflow-slack-channels) and then join `#kubeflow-spark-operator` Channel.
+- Join the [CNCF Slack Channel](https://www.kubeflow.org/docs/about/community/#kubeflow-slack-channels) and then join `#kubeflow-spark-on-kubernetes` Channel.
 - Check out our blog post [Announcing the Kubeflow Spark Operator: Building a Stronger Spark on Kubernetes Community](https://blog.kubeflow.org/operators/2024/04/15/kubeflow-spark-operator.html).
 - Join our monthly community meeting [Kubeflow Spark Operator Meeting Notes](https://bit.ly/3VGzP4n).
 

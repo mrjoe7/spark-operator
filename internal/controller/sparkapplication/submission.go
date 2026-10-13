@@ -22,12 +22,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
 	"github.com/kubeflow/spark-operator/v2/pkg/common"
+	"github.com/kubeflow/spark-operator/v2/pkg/features"
 	"github.com/kubeflow/spark-operator/v2/pkg/util"
 )
 
@@ -48,7 +54,7 @@ var _ SparkApplicationSubmitter = &SparkSubmitter{}
 func (*SparkSubmitter) Submit(ctx context.Context, app *v1beta2.SparkApplication) error {
 	logger := log.FromContext(ctx)
 
-	args, err := buildSparkSubmitArgs(app)
+	args, err := buildSparkSubmitArgs(app, false)
 	if err != nil {
 		return fmt.Errorf("failed to build spark-submit arguments: %v", err)
 	}
@@ -88,12 +94,15 @@ func runSparkSubmit(args []string) error {
 }
 
 // buildSparkSubmitArgs builds the arguments for spark-submit.
-func buildSparkSubmitArgs(app *v1beta2.SparkApplication) ([]string, error) {
+// When skipPodTemplates is true, pod template file options are skipped
+// as the submission strategy handles pod templates separately.
+func buildSparkSubmitArgs(app *v1beta2.SparkApplication, skipPodTemplates bool) ([]string, error) {
 	optionFuncs := []sparkSubmitOptionFunc{
 		masterOption,
 		deployModeOption,
 		mainClassOption,
 		nameOption,
+		loadSparkDefaultsOption,
 		dependenciesOption,
 		namespaceOption,
 		imageOption,
@@ -102,23 +111,28 @@ func buildSparkSubmitArgs(app *v1beta2.SparkApplication) ([]string, error) {
 		submissionWaitAppCompletionOption,
 		sparkConfOption,
 		hadoopConfOption,
-		driverPodTemplateOption,
 		driverPodNameOption,
 		driverConfOption,
 		driverEnvOption,
 		driverSecretOption,
 		driverVolumeMountsOption,
-		executorPodTemplateOption,
 		executorConfOption,
 		executorEnvOption,
 		executorSecretOption,
 		executorVolumeMountsOption,
 		nodeSelectorOption,
 		dynamicAllocationOption,
-		proxyUserOption,
-		mainApplicationFileOption,
-		applicationOption,
 	}
+
+	// Pod template options write files and add --conf args; skipped when the submission
+	// strategy sends templates inline (e.g., REST submitter).
+	if !skipPodTemplates {
+		optionFuncs = append(optionFuncs, driverPodTemplateOption, executorPodTemplateOption)
+	}
+
+	// These must come last: proxyUser is a spark-submit flag, mainApplicationFile is the
+	// positional JAR/py path, and applicationOption produces application arguments.
+	optionFuncs = append(optionFuncs, proxyUserOption, mainApplicationFileOption, applicationOption)
 
 	var args []string
 	for _, optionFunc := range optionFuncs {
@@ -385,6 +399,13 @@ func driverConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 
 	// Populate SparkApplication labels to driver pod
 	for key, value := range app.Labels {
+		// Don't propagate Kueue labels to driver pod.
+		// This is a quick workaround to avoid issues in Kueue integration.
+		// Community may consider a better label propagation control mechanisms in the future.
+		// ref: https://github.com/kubeflow/spark-operator/issues/2669#issuecomment-3500165528
+		if strings.HasPrefix(key, common.KueueLabelPrefix) {
+			continue
+		}
 		property = fmt.Sprintf(common.SparkKubernetesDriverLabelTemplate, key)
 		args = append(args, "--conf", fmt.Sprintf("%s=%s", property, value))
 	}
@@ -533,6 +554,22 @@ func driverVolumeMountsOption(app *v1beta2.SparkApplication) ([]string, error) {
 							"sizeLimit",
 						),
 						volume.EmptyDir.SizeLimit.String(),
+					),
+				)
+			}
+			if volume.EmptyDir.Medium != corev1.StorageMediumDefault {
+				args = append(
+					args,
+					"--conf",
+					fmt.Sprintf(
+						"%s=%s",
+						fmt.Sprintf(
+							common.SparkKubernetesDriverVolumesOptionsTemplate,
+							common.VolumeTypeEmptyDir,
+							volume.Name,
+							"medium",
+						),
+						volume.EmptyDir.Medium,
 					),
 				)
 			}
@@ -730,6 +767,13 @@ func executorConfOption(app *v1beta2.SparkApplication) ([]string, error) {
 
 	// Populate SparkApplication labels to executor pod
 	for key, value := range app.Labels {
+		// Don't propagate Kueue labels to driver pod.
+		// This is a quick workaround to avoid issues in Kueue integration.
+		// Community may consider a better label propagation control mechanisms in the future.
+		// ref: https://github.com/kubeflow/spark-operator/issues/2669#issuecomment-3500165528
+		if strings.HasPrefix(key, common.KueueLabelPrefix) {
+			continue
+		}
 		property := fmt.Sprintf(common.SparkKubernetesExecutorLabelTemplate, key)
 		args = append(args, "--conf", fmt.Sprintf("%s=%s", property, value))
 	}
@@ -869,6 +913,22 @@ func executorVolumeMountsOption(app *v1beta2.SparkApplication) ([]string, error)
 							"sizeLimit",
 						),
 						volume.EmptyDir.SizeLimit.String(),
+					),
+				)
+			}
+			if volume.EmptyDir.Medium != corev1.StorageMediumDefault {
+				args = append(
+					args,
+					"--conf",
+					fmt.Sprintf(
+						"%s=%s",
+						fmt.Sprintf(
+							common.SparkKubernetesExecutorVolumesOptionsTemplate,
+							common.VolumeTypeEmptyDir,
+							volume.Name,
+							"medium",
+						),
+						volume.EmptyDir.Medium,
 					),
 				)
 			}
@@ -1061,12 +1121,10 @@ func applicationOption(app *v1beta2.SparkApplication) ([]string, error) {
 
 // driverPodTemplateOption returns the driver pod template arguments.
 func driverPodTemplateOption(app *v1beta2.SparkApplication) ([]string, error) {
-	if app.Spec.Driver.Template == nil {
-		return []string{}, nil
-	}
+	template := buildDriverPodTemplate(app)
 
 	podTemplateFile := fmt.Sprintf("/tmp/spark/%s/driver-pod-template.yaml", app.Status.SubmissionID)
-	if err := util.WriteObjectToFile(app.Spec.Driver.Template, podTemplateFile); err != nil {
+	if err := util.WriteObjectToFile(template, podTemplateFile); err != nil {
 		return []string{}, fmt.Errorf("failed to write driver pod template to file: %v", err)
 	}
 
@@ -1081,12 +1139,10 @@ func driverPodTemplateOption(app *v1beta2.SparkApplication) ([]string, error) {
 
 // executorPodTemplateOption returns the executor pod template arguments.
 func executorPodTemplateOption(app *v1beta2.SparkApplication) ([]string, error) {
-	if app.Spec.Executor.Template == nil {
-		return []string{}, nil
-	}
+	template := buildExecutorPodTemplate(app)
 
 	podTemplateFile := fmt.Sprintf("/tmp/spark/%s/executor-pod-template.yaml", app.Status.SubmissionID)
-	if err := util.WriteObjectToFile(app.Spec.Executor.Template, podTemplateFile); err != nil {
+	if err := util.WriteObjectToFile(template, podTemplateFile); err != nil {
 		return []string{}, fmt.Errorf("failed to write executor pod template to file: %v", err)
 	}
 
@@ -1095,6 +1151,64 @@ func executorPodTemplateOption(app *v1beta2.SparkApplication) ([]string, error) 
 		fmt.Sprintf("%s=%s", common.SparkKubernetesExecutorPodTemplateFile, podTemplateFile),
 		"--conf",
 		fmt.Sprintf("%s=%s", common.SparkKubernetesExecutorPodTemplateContainerName, common.Spark3DefaultExecutorContainerName),
+	}
+	return args, nil
+}
+
+// buildDriverPodTemplate returns a driver pod template ready for submission.
+func buildDriverPodTemplate(app *v1beta2.SparkApplication) *corev1.PodTemplateSpec {
+	template := app.Spec.Driver.Template
+	// Spark expects the template to have a driver container
+	// if user specifies a driver pod template, it is responsible
+	// for user to ensure the template has a driver container
+	if template == nil {
+		template = &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: common.SparkDriverContainerName}},
+			},
+		}
+	} else {
+		template = template.DeepCopy()
+	}
+
+	ownerReference := util.GetOwnerReference(app)
+	if !slices.ContainsFunc(template.OwnerReferences, func(r metav1.OwnerReference) bool {
+		return reflect.DeepEqual(r, ownerReference)
+	}) {
+		template.OwnerReferences = append(template.OwnerReferences, ownerReference)
+	}
+	return template
+}
+
+// buildExecutorPodTemplate returns an executor pod template ready for submission.
+func buildExecutorPodTemplate(app *v1beta2.SparkApplication) *corev1.PodTemplateSpec {
+	template := app.Spec.Executor.Template
+	// Spark expects the template to have a driver container
+	// if user specifies a driver pod template, it is responsible
+	// for user to ensure the template has a driver container
+	if template == nil {
+		template = &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: common.Spark3DefaultExecutorContainerName}},
+			},
+		}
+	} else {
+		template = template.DeepCopy()
+	}
+
+	// Executor pods are controlled by the driver pod (Spark sets the controller
+	// reference itself). Do not add the SparkApplication as an additional owner:
+	// Kubernetes garbage collection only removes a dependent once all of its
+	// owners are gone, so a second owner would keep executor pods alive after
+	// the driver pod is deleted (e.g. on suspend).
+	return template
+}
+
+// loadSparkDefaultsOption adds `--load-spark-defaults` flag to the command when feature gate `LoadSparkDefaults` is enabled.
+func loadSparkDefaultsOption(_ *v1beta2.SparkApplication) ([]string, error) {
+	args := []string{}
+	if features.Enabled(features.LoadSparkDefaults) {
+		args = append(args, "--load-spark-defaults")
 	}
 	return args, nil
 }

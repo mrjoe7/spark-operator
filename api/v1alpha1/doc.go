@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// +k8s:openapi-gen=true
 // +k8s:deepcopy-gen=package,register
 
 // Package v1alpha1 is the v1alpha1 version of the API.
+//
+// SparkConnect uses the sparkoperator.k8s.io/v1alpha1 API. An alpha API can
+// change in a future release.
 // +groupName=sparkoperator.k8s.io
 // +versionName=v1alpha1
 package v1alpha1

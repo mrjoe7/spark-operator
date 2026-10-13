@@ -18,9 +18,9 @@ package webhook
 
 import (
 	"context"
-	"crypto/tls"
 	"flag"
 	"os"
+	"slices"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -36,10 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,19 +45,21 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	sparkoperator "github.com/kubeflow/spark-operator/v2"
+	operatortls "github.com/kubeflow/spark-operator/v2/pkg/tls"
+
+	"github.com/kubeflow/spark-operator/v2/api/v1alpha1"
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
 	"github.com/kubeflow/spark-operator/v2/internal/controller/mutatingwebhookconfiguration"
 	"github.com/kubeflow/spark-operator/v2/internal/controller/validatingwebhookconfiguration"
 	"github.com/kubeflow/spark-operator/v2/internal/webhook"
 	"github.com/kubeflow/spark-operator/v2/pkg/certificate"
 	"github.com/kubeflow/spark-operator/v2/pkg/common"
-	"github.com/kubeflow/spark-operator/v2/pkg/util"
+	operatorscheme "github.com/kubeflow/spark-operator/v2/pkg/scheme"
+	"github.com/kubeflow/spark-operator/v2/pkg/version"
 	// +kubebuilder:scaffold:imports
 )
 
 var (
-	scheme = runtime.NewScheme()
 	logger = ctrl.Log.WithName("")
 )
 
@@ -96,6 +95,10 @@ var (
 	leaderElectionRenewDeadline time.Duration
 	leaderElectionRetryPeriod   time.Duration
 
+	// Kubernetes API server QPS and Burst for the controller manager's client.
+	kubeAPIQPS   float32
+	kubeAPIBurst int
+
 	// Metrics
 	enableMetrics      bool
 	metricsBindAddress string
@@ -105,17 +108,11 @@ var (
 
 	healthProbeBindAddress string
 	secureMetrics          bool
-	enableHTTP2            bool
+	tlsMinVersion          string
+	tlsCipherSuites        []string
 	development            bool
 	zapOptions             = logzap.Options{}
 )
-
-func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
-	utilruntime.Must(v1beta2.AddToScheme(scheme))
-	// +kubebuilder:scaffold:scheme
-}
 
 func NewStartCommand() *cobra.Command {
 	var command = &cobra.Command{
@@ -125,7 +122,7 @@ func NewStartCommand() *cobra.Command {
 			development = viper.GetBool("development")
 		},
 		Run: func(cmd *cobra.Command, args []string) {
-			sparkoperator.PrintVersion(false)
+			version.PrintVersion(false)
 			start()
 		},
 	}
@@ -135,6 +132,9 @@ func NewStartCommand() *cobra.Command {
 	command.Flags().StringSliceVar(&namespaces, "namespaces", []string{}, "The Kubernetes namespace to manage. Will manage custom resource objects of the managed CRD types for the whole cluster if unset or contains empty string.")
 	command.Flags().StringVar(&labelSelectorFilter, "label-selector-filter", "", "A comma-separated list of key=value, or key labels to filter resources during watch and list based on the specified labels.")
 	command.Flags().DurationVar(&cacheSyncTimeout, "cache-sync-timeout", 30*time.Second, "Informer cache sync timeout.")
+
+	command.Flags().Float32Var(&kubeAPIQPS, "kube-api-qps", 20, "Maximum QPS to the API server from the controller client.")
+	command.Flags().IntVar(&kubeAPIBurst, "kube-api-burst", 30, "Maximum burst for throttle from the controller client.")
 
 	// Webhook
 	command.Flags().StringVar(&webhookCertDir, "webhook-cert-dir", "/etc/k8s-webhook-server/serving-certs", "The directory that contains the webhook server key and certificate. "+
@@ -159,8 +159,8 @@ func NewStartCommand() *cobra.Command {
 	command.Flags().StringVar(&leaderElectionLockName, "leader-election-lock-name", "spark-operator-lock", "Name of the ConfigMap for leader election.")
 	command.Flags().StringVar(&leaderElectionLockNamespace, "leader-election-lock-namespace", "spark-operator", "Namespace in which to create the ConfigMap for leader election.")
 	command.Flags().DurationVar(&leaderElectionLeaseDuration, "leader-election-lease-duration", 15*time.Second, "Leader election lease duration.")
-	command.Flags().DurationVar(&leaderElectionRenewDeadline, "leader-election-renew-deadline", 14*time.Second, "Leader election renew deadline.")
-	command.Flags().DurationVar(&leaderElectionRetryPeriod, "leader-election-retry-period", 4*time.Second, "Leader election retry period.")
+	command.Flags().DurationVar(&leaderElectionRenewDeadline, "leader-election-renew-deadline", 10*time.Second, "Leader election renew deadline.")
+	command.Flags().DurationVar(&leaderElectionRetryPeriod, "leader-election-retry-period", 2*time.Second, "Leader election retry period.")
 
 	// Prometheus metrics
 	command.Flags().BoolVar(&enableMetrics, "enable-metrics", false, "Enable metrics.")
@@ -172,7 +172,13 @@ func NewStartCommand() *cobra.Command {
 
 	command.Flags().StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	command.Flags().BoolVar(&secureMetrics, "secure-metrics", false, "If set the metrics endpoint is served securely")
-	command.Flags().BoolVar(&enableHTTP2, "enable-http2", false, "If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	command.Flags().StringVar(&tlsMinVersion, "webhook-tls-min-version", "VersionTLS12",
+		"Minimum TLS version for the webhook and metrics servers. "+
+			"Possible values: VersionTLS12, VersionTLS13")
+	command.Flags().StringSliceVar(&tlsCipherSuites, "webhook-tls-cipher-suites", []string{},
+		"Comma-separated list of cipher suites for the webhook and metrics servers. "+
+			"If omitted, the default Go cipher suites are used. "+
+			"Applies to TLS 1.2 only; TLS 1.3 cipher suites are not configurable in Go. Possible values listed at https://pkg.go.dev/crypto/tls#CipherSuites")
 
 	flagSet := flag.NewFlagSet("controller", flag.ExitOnError)
 	ctrl.RegisterFlags(flagSet)
@@ -192,11 +198,19 @@ func start() {
 		os.Exit(1)
 	}
 
+	cfg.QPS = kubeAPIQPS
+	cfg.Burst = kubeAPIBurst
+
 	// Create the manager.
-	tlsOptions := newTLSOptions()
+	tlsOptions, err := operatortls.SetupTLS("webhook", tlsMinVersion, tlsCipherSuites)
+	if err != nil {
+		logger.Error(err, "Failed to set up TLS")
+		os.Exit(1)
+	}
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme,
+		Scheme: operatorscheme.WebhookScheme,
 		Cache:  newCacheOptions(),
+		Client: client.Options{},
 		Metrics: metricsserver.Options{
 			BindAddress:   metricsBindAddress,
 			SecureServing: secureMetrics,
@@ -213,6 +227,9 @@ func start() {
 		LeaderElection:          enableLeaderElection,
 		LeaderElectionID:        leaderElectionLockName,
 		LeaderElectionNamespace: leaderElectionLockNamespace,
+		LeaseDuration:           &leaderElectionLeaseDuration,
+		RenewDeadline:           &leaderElectionRenewDeadline,
+		RetryPeriod:             &leaderElectionRetryPeriod,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -290,27 +307,36 @@ func start() {
 		}
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&v1beta2.SparkApplication{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &v1alpha1.SparkConnect{}).
+		WithDefaulter(webhook.NewSparkConnectDefaulter()).
+		WithValidator(webhook.NewSparkConnectValidator()).
+		WithLogConstructor(webhook.LogConstructor).
+		Complete(); err != nil {
+		logger.Error(err, "Failed to create mutating webhook for SparkConnect")
+		os.Exit(1)
+	}
+
+	if err := ctrl.NewWebhookManagedBy(mgr, &v1beta2.SparkApplication{}).
 		WithDefaulter(webhook.NewSparkApplicationDefaulter()).
 		WithValidator(webhook.NewSparkApplicationValidator(mgr.GetClient(), enableResourceQuotaEnforcement)).
+		WithLogConstructor(webhook.LogConstructor).
 		Complete(); err != nil {
 		logger.Error(err, "Failed to create mutating webhook for Spark application")
 		os.Exit(1)
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&v1beta2.ScheduledSparkApplication{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &v1beta2.ScheduledSparkApplication{}).
 		WithDefaulter(webhook.NewScheduledSparkApplicationDefaulter()).
 		WithValidator(webhook.NewScheduledSparkApplicationValidator()).
+		WithLogConstructor(webhook.LogConstructor).
 		Complete(); err != nil {
 		logger.Error(err, "Failed to create mutating webhook for Scheduled Spark application")
 		os.Exit(1)
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&corev1.Pod{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &corev1.Pod{}).
 		WithDefaulter(webhook.NewSparkPodDefaulter(mgr.GetClient(), namespaces)).
+		WithLogConstructor(webhook.LogConstructor).
 		Complete(); err != nil {
 		logger.Error(err, "Failed to create mutating webhook for Spark pod")
 		os.Exit(1)
@@ -341,46 +367,20 @@ func setupLog() {
 		logzap.UseFlagOptions(&zapOptions),
 		func(o *logzap.Options) {
 			o.Development = development
-		}, func(o *logzap.Options) {
 			o.ZapOpts = append(o.ZapOpts, zap.AddCaller())
-		}, func(o *logzap.Options) {
-			var config zapcore.EncoderConfig
-			if !development {
-				config = zap.NewProductionEncoderConfig()
-			} else {
-				config = zap.NewDevelopmentEncoderConfig()
-			}
-			config.EncodeLevel = zapcore.CapitalColorLevelEncoder
-			config.EncodeTime = zapcore.ISO8601TimeEncoder
-			config.EncodeCaller = zapcore.ShortCallerEncoder
-			o.Encoder = zapcore.NewConsoleEncoder(config)
+			o.EncoderConfigOptions = append(o.EncoderConfigOptions, func(config *zapcore.EncoderConfig) {
+				config.EncodeLevel = zapcore.CapitalLevelEncoder
+				config.EncodeTime = zapcore.ISO8601TimeEncoder
+				config.EncodeCaller = zapcore.ShortCallerEncoder
+			})
 		}),
 	)
-}
-
-func newTLSOptions() []func(c *tls.Config) {
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		logger.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
-	}
-
-	tlsOpts := []func(*tls.Config){}
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
-	}
-	return tlsOpts
 }
 
 // newCacheOptions creates and returns a cache.Options instance configured with default namespaces and object caching settings.
 func newCacheOptions() cache.Options {
 	defaultNamespaces := make(map[string]cache.Config)
-	if !util.ContainsString(namespaces, cache.AllNamespaces) {
+	if !slices.Contains(namespaces, cache.AllNamespaces) {
 		for _, ns := range namespaces {
 			defaultNamespaces[ns] = cache.Config{}
 		}
@@ -392,6 +392,7 @@ func newCacheOptions() cache.Options {
 				common.LabelLaunchedBySparkOperator: "true",
 			}),
 		},
+		&corev1.ResourceQuota{}:              {},
 		&v1beta2.SparkApplication{}:          {},
 		&v1beta2.ScheduledSparkApplication{}: {},
 		&admissionregistrationv1.MutatingWebhookConfiguration{}: {
@@ -406,13 +407,10 @@ func newCacheOptions() cache.Options {
 		},
 	}
 
-	if enableResourceQuotaEnforcement {
-		byObject[&corev1.ResourceQuota{}] = cache.ByObject{}
-	}
-
 	options := cache.Options{
-		Scheme:            scheme,
+		Scheme:            operatorscheme.WebhookScheme,
 		DefaultNamespaces: defaultNamespaces,
+		DefaultTransform:  cache.TransformStripManagedFields(),
 		ByObject:          byObject,
 	}
 

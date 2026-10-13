@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/kubeflow/spark-operator/v2/pkg/common"
 	"github.com/kubeflow/spark-operator/v2/pkg/util"
@@ -68,22 +69,6 @@ var _ = Describe("GetMasterURL", func() {
 	})
 })
 
-var _ = Describe("ContainsString", func() {
-	slice := []string{"a", "b", "c"}
-
-	Context("When the string is in the slice", func() {
-		It("Should return true", func() {
-			Expect(util.ContainsString(slice, "b")).To(BeTrue())
-		})
-	})
-
-	Context("When the string is not in the slice", func() {
-		It("Should return false", func() {
-			Expect(util.ContainsString(slice, "d")).To(BeFalse())
-		})
-	})
-})
-
 var _ = Describe("RemoveString", func() {
 	Context("When the string is in the slice", func() {
 		slice := []string{"a", "b", "c"}
@@ -107,28 +92,28 @@ var _ = Describe("RemoveString", func() {
 var _ = Describe("BoolPtr", func() {
 	It("Should return a pointer to the given bool value", func() {
 		b := true
-		Expect(util.BoolPtr(b)).To(Equal(&b))
+		Expect(ptr.To(b)).To(Equal(&b))
 	})
 })
 
 var _ = Describe("Int32Ptr", func() {
 	It("Should return a pointer to the given int32 value", func() {
 		i := int32(42)
-		Expect(util.Int32Ptr(i)).To(Equal(&i))
+		Expect(ptr.To[int32](i)).To(Equal(&i))
 	})
 })
 
 var _ = Describe("Int64Ptr", func() {
 	It("Should return a pointer to the given int64 value", func() {
 		i := int64(42)
-		Expect(util.Int64Ptr(i)).To(Equal(&i))
+		Expect(ptr.To[int64](i)).To(Equal(&i))
 	})
 })
 
 var _ = Describe("StringPtr", func() {
 	It("Should return a pointer to the given string value", func() {
 		s := "hello"
-		Expect(util.StringPtr(s)).To(Equal(&s))
+		Expect(ptr.To(s)).To(Equal(&s))
 	})
 })
 
@@ -179,7 +164,6 @@ var _ = Describe("WriteObjectToFile", func() {
   annotations:
     key3: value3
     key4: value4
-  creationTimestamp: null
   labels:
     key1: value1
     key2: value2
@@ -205,26 +189,36 @@ spec:
 var _ = Describe("ConvertJavaMemoryStringToK8sMemoryString", func() {
 	It("Should return a memory converted in expected K8s unit", func() {
 
-		unitMap := map[string]string{
-			"k":  "Ki",
-			"kb": "Ki",
-			"m":  "Mi",
-			"mb": "Mi",
-			"g":  "Gi",
-			"gb": "Gi",
-			"t":  "Ti",
-			"tb": "Ti",
-			"p":  "Pi",
-			"pb": "Pi",
-			"Ki": "Ki",
-			"Mi": "Mi",
-			"Gi": "Gi",
-			"Ti": "Ti",
-			"Pi": "Pi",
+		testCases := map[string]string{
+			"100k":   "100Ki",
+			"512m":   "512Mi",
+			"2g":     "2Gi",
+			"1t":     "1Ti",
+			"1p":     "1Pi",
+			"100K":   "100Ki",
+			"512M":   "512Mi",
+			"2G":     "2Gi",
+			"1T":     "1Ti",
+			"1P":     "1Pi",
+			"2gb":    "2Gi",
+			"2GB":    "2Gi",
+			"2Gb":    "2Gi",
+			"2gB":    "2Gi",
+			"512mb":  "512Mi",
+			"512MB":  "512Mi",
+			"100Ki":  "100Ki",
+			"512Mi":  "512Mi",
+			"2Gi":    "2Gi",
+			" 2G":    "2Gi",
+			"2G ":    "2Gi",
+			"  2G  ": "2Gi",
+			"1024":   "1024",
+			"":       "",
 		}
 
-		for unit, response := range unitMap {
-			Expect(util.ConvertJavaMemoryStringToK8sMemoryString(unit)).To(Equal(response))
+		for input, expected := range testCases {
+			Expect(util.ConvertJavaMemoryStringToK8sMemoryString(input)).
+				To(Equal(expected), "input: %q", input)
 		}
 	})
 })

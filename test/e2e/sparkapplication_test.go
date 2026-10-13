@@ -33,7 +33,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	clientretry "k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
 	"github.com/kubeflow/spark-operator/v2/pkg/common"
@@ -438,12 +440,27 @@ var _ = Describe("Example SparkApplication", func() {
 				g.Expect(app.Status.AppState.State).To(Equal(v1beta2.ApplicationStateRunning))
 			}).WithTimeout(5 * time.Second).Should(Succeed())
 
+			By("Waiting for executor pods to be created")
+			Eventually(func(g Gomega) {
+				podList := &corev1.PodList{}
+				g.Expect(k8sClient.List(ctx, podList, client.InNamespace(app.Namespace), client.MatchingLabels{
+					common.LabelSparkAppName: app.Name,
+					common.LabelSparkRole:    common.SparkRoleExecutor,
+				})).To(Succeed())
+				g.Expect(podList.Items).NotTo(BeEmpty())
+			}).WithTimeout(1 * time.Minute).Should(Succeed())
+
 			By("Suspending Spark Application")
 			Eventually(func(g Gomega) {
-				app := &v1beta2.SparkApplication{}
-				Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
-				app.Spec.Suspend = ptr.To(true)
-				Expect(k8sClient.Update(ctx, app)).To(Succeed())
+				err := clientretry.RetryOnConflict(clientretry.DefaultRetry, func() error {
+					app := &v1beta2.SparkApplication{}
+					if err := k8sClient.Get(ctx, key, app); err != nil {
+						return err
+					}
+					app.Spec.Suspend = ptr.To(true)
+					return k8sClient.Update(ctx, app)
+				})
+				g.Expect(err).NotTo(HaveOccurred())
 			}).WithTimeout(5 * time.Second).Should(Succeed())
 
 			By("Waiting for SparkApplication to Suspended")
@@ -453,12 +470,26 @@ var _ = Describe("Example SparkApplication", func() {
 				g.Expect(app.Status.AppState.State).To(Equal(v1beta2.ApplicationStateSuspended))
 			}).WithTimeout(3 * time.Minute).Should(Succeed())
 
+			By("Waiting for driver and executor pods to be garbage collected")
+			Eventually(func(g Gomega) {
+				podList := &corev1.PodList{}
+				g.Expect(k8sClient.List(ctx, podList, client.InNamespace(app.Namespace), client.MatchingLabels{
+					common.LabelSparkAppName: app.Name,
+				})).To(Succeed())
+				g.Expect(podList.Items).To(BeEmpty())
+			}).WithTimeout(3 * time.Minute).Should(Succeed())
+
 			By("Resuming for SparkApplication")
 			Eventually(func(g Gomega) {
-				app := &v1beta2.SparkApplication{}
-				Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
-				app.Spec.Suspend = ptr.To(false)
-				Expect(k8sClient.Update(ctx, app)).To(Succeed())
+				err := clientretry.RetryOnConflict(clientretry.DefaultRetry, func() error {
+					app := &v1beta2.SparkApplication{}
+					if err := k8sClient.Get(ctx, key, app); err != nil {
+						return err
+					}
+					app.Spec.Suspend = ptr.To(false)
+					return k8sClient.Update(ctx, app)
+				})
+				g.Expect(err).NotTo(HaveOccurred())
 			}).WithTimeout(5 * time.Second).Should(Succeed())
 
 			By("Waiting for SparkApplication to Running")
@@ -481,6 +512,151 @@ var _ = Describe("Example SparkApplication", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(bytes).NotTo(BeEmpty())
 			Expect(strings.Contains(string(bytes), "Pi is roughly 3")).To(BeTrue())
+		})
+	})
+
+	Context("sparkConf-key-authorization", func() {
+		ctx := context.Background()
+		mainFile := "local:///opt/spark/examples/jars/spark-examples.jar"
+
+		It("should reject a SparkApplication with a denied sparkConf key", func() {
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sparkconf-denied-key",
+					Namespace: "default",
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					Type:                v1beta2.SparkApplicationTypeScala,
+					SparkVersion:        "3.5.0",
+					Mode:                v1beta2.DeployModeCluster,
+					MainApplicationFile: &mainFile,
+					MainClass:           ptr.To("org.apache.spark.examples.SparkPi"),
+					Driver: v1beta2.DriverSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							Cores:  ptr.To[int32](1),
+							Memory: ptr.To("512m"),
+						},
+					},
+					Executor: v1beta2.ExecutorSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							Cores:  ptr.To[int32](1),
+							Memory: ptr.To("512m"),
+						},
+						Instances: ptr.To[int32](1),
+					},
+					SparkConf: map[string]string{
+						common.SparkKubernetesAuthenticateDriverServiceAccountName: "cluster-admin",
+					},
+				},
+			}
+
+			By("Creating SparkApplication with denied sparkConf key")
+			err := k8sClient.Create(ctx, app)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("is not allowed"))
+		})
+
+		It("should accept a SparkApplication with safe sparkConf keys via dry-run", func() {
+			app := &v1beta2.SparkApplication{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sparkconf-safe-key",
+					Namespace: "default",
+				},
+				Spec: v1beta2.SparkApplicationSpec{
+					Type:                v1beta2.SparkApplicationTypeScala,
+					SparkVersion:        "3.5.0",
+					Mode:                v1beta2.DeployModeCluster,
+					MainApplicationFile: &mainFile,
+					MainClass:           ptr.To("org.apache.spark.examples.SparkPi"),
+					Driver: v1beta2.DriverSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							Cores:  ptr.To[int32](1),
+							Memory: ptr.To("512m"),
+						},
+					},
+					Executor: v1beta2.ExecutorSpec{
+						SparkPodSpec: v1beta2.SparkPodSpec{
+							Cores:  ptr.To[int32](1),
+							Memory: ptr.To("512m"),
+						},
+						Instances: ptr.To[int32](1),
+					},
+					SparkConf: map[string]string{
+						"spark.executor.memory": "4g",
+					},
+				},
+			}
+
+			By("Creating SparkApplication with safe sparkConf via dry-run")
+			err := k8sClient.Create(ctx, app, client.DryRunAll)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("spark-pi-emptydir-medium", func() {
+		ctx := context.Background()
+		path := filepath.Join("..", "..", "examples", "spark-pi-emptydir.yaml")
+		app := &v1beta2.SparkApplication{}
+
+		BeforeEach(func() {
+			By("Parsing SparkApplication from file")
+			file, err := os.Open(path)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(file).NotTo(BeNil())
+
+			decoder := yaml.NewYAMLOrJSONDecoder(file, 4096)
+			Expect(decoder.Decode(app)).To(Succeed())
+
+			By("Creating SparkApplication")
+			Expect(k8sClient.Create(ctx, app)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			key := types.NamespacedName{Namespace: app.Namespace, Name: app.Name}
+			Expect(k8sClient.Get(ctx, key, app)).To(Succeed())
+
+			By("Deleting SparkApplication")
+			Expect(k8sClient.Delete(ctx, app)).To(Succeed())
+		})
+
+		It("should mount emptyDir with Memory medium on driver pod", func() {
+			By("Waiting for SparkApplication to complete")
+			key := types.NamespacedName{Namespace: app.Namespace, Name: app.Name}
+			Expect(waitForSparkApplicationCompleted(ctx, key)).NotTo(HaveOccurred())
+
+			checkVolumeAndMount := func(pod corev1.Pod, containerName string) {
+				volumeFound := false
+				for _, vol := range pod.Spec.Volumes {
+					if vol.Name == "spark-local-dir-1" {
+						volumeFound = true
+						Expect(vol.EmptyDir).NotTo(BeNil(), "pod %s: spark-local-dir-1 is not an emptyDir", pod.Name)
+						Expect(vol.EmptyDir.Medium).To(Equal(corev1.StorageMediumMemory), "pod %s", pod.Name)
+						break
+					}
+				}
+				Expect(volumeFound).To(BeTrue(), "pod %s: volume spark-local-dir-1 not found", pod.Name)
+
+				mountFound := false
+				for _, container := range pod.Spec.Containers {
+					if container.Name != containerName {
+						continue
+					}
+					for _, mount := range container.VolumeMounts {
+						if mount.Name == "spark-local-dir-1" {
+							mountFound = true
+							break
+						}
+					}
+				}
+				Expect(mountFound).To(BeTrue(), "pod %s: volumeMount spark-local-dir-1 not found in container %s", pod.Name, containerName)
+			}
+
+			By("Checking driver pod has spark-local-dir-1 with Memory medium and volumeMount")
+			driverPodName := util.GetDriverPodName(app)
+			driverPodKey := types.NamespacedName{Namespace: app.Namespace, Name: driverPodName}
+			driverPod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, driverPodKey, driverPod)).NotTo(HaveOccurred())
+			checkVolumeAndMount(*driverPod, common.SparkDriverContainerName)
 		})
 	})
 })

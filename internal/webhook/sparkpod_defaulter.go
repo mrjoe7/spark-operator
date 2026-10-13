@@ -18,15 +18,18 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"reflect"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
@@ -38,7 +41,7 @@ const (
 	maxNameLength = 63
 )
 
-// +kubebuilder:webhook:admissionReviewVersions=v1,failurePolicy=fail,groups="",matchPolicy=Exact,mutating=true,name=mutate-pod.sparkoperator.k8s.io,path=/mutate--v1-pod,reinvocationPolicy=Never,resources=pods,sideEffects=None,verbs=create;update,versions=v1,webhookVersions=v1
+// +kubebuilder:webhook:admissionReviewVersions=v1,failurePolicy=fail,groups="",matchPolicy=Exact,mutating=true,name=mutate-pod.sparkoperator.k8s.io,path=/mutate--v1-pod,reinvocationPolicy=Never,resources=pods,sideEffects=None,verbs=create,versions=v1,webhookVersions=v1
 
 // SparkPodDefaulter defaults Spark pods.
 type SparkPodDefaulter struct {
@@ -47,7 +50,7 @@ type SparkPodDefaulter struct {
 }
 
 // SparkPodDefaulter implements admission.CustomDefaulter.
-var _ admission.CustomDefaulter = &SparkPodDefaulter{}
+var _ admission.Defaulter[*corev1.Pod] = &SparkPodDefaulter{}
 
 // NewSparkPodDefaulter creates a new SparkPodDefaulter instance.
 func NewSparkPodDefaulter(client client.Client, namespaces []string) *SparkPodDefaulter {
@@ -66,13 +69,13 @@ func NewSparkPodDefaulter(client client.Client, namespaces []string) *SparkPodDe
 	}
 }
 
-// Default implements admission.CustomDefaulter.
-func (d *SparkPodDefaulter) Default(ctx context.Context, obj runtime.Object) error {
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
+// Default implements admission.Defaulter.
+func (d *SparkPodDefaulter) Default(ctx context.Context, pod *corev1.Pod) error {
+	if pod == nil {
 		return nil
 	}
 
+	logger := log.FromContext(ctx)
 	namespace := pod.Namespace
 	if !d.isSparkJobNamespace(namespace) {
 		return nil
@@ -88,9 +91,8 @@ func (d *SparkPodDefaulter) Default(ctx context.Context, obj runtime.Object) err
 		return fmt.Errorf("failed to get SparkApplication %s/%s: %v", namespace, appName, err)
 	}
 
-	logger.Info("Mutating Spark pod", "name", pod.Name, "namespace", namespace, "phase", pod.Status.Phase)
+	logger.Info("Mutating Pod", "phase", pod.Status.Phase)
 	if err := mutateSparkPod(pod, app); err != nil {
-		logger.Info("Denying Spark pod", "name", pod.Name, "namespace", namespace, "errorMessage", err.Error())
 		return fmt.Errorf("failed to mutate Spark pod: %v", err)
 	}
 
@@ -126,7 +128,6 @@ func addMemoryLimit(pod *corev1.Pod, app *v1beta2.SparkApplication) error {
 
 	// Apply the memory limit to the container's resources
 	pod.Spec.Containers[i].Resources.Limits[corev1.ResourceMemory] = limitQuantity
-	logger.V(1).Info("Added memory limit to Spark container in pod", "name", pod.Name, "namespace", pod.Namespace, "memoryLimit", limitQuantity.String())
 	return nil
 }
 
@@ -180,7 +181,11 @@ func addOwnerReference(pod *corev1.Pod, app *v1beta2.SparkApplication) error {
 		return nil
 	}
 	ownerReference := util.GetOwnerReference(app)
-	pod.OwnerReferences = append(pod.OwnerReferences, ownerReference)
+	if !slices.ContainsFunc(pod.OwnerReferences, func(r metav1.OwnerReference) bool {
+		return reflect.DeepEqual(r, ownerReference)
+	}) {
+		pod.OwnerReferences = append(pod.OwnerReferences, ownerReference)
+	}
 	return nil
 }
 
@@ -330,14 +335,14 @@ func addGeneralConfigMaps(pod *corev1.Pod, app *v1beta2.SparkApplication) error 
 		configMaps = app.Spec.Executor.ConfigMaps
 	}
 
+	addedVolumes := make(map[string]bool, len(configMaps))
 	for _, namePath := range configMaps {
-		volumeName := namePath.Name + "-vol"
-		if len(volumeName) > maxNameLength {
-			volumeName = volumeName[0:maxNameLength]
-			logger.Info(fmt.Sprintf("ConfigMap volume name is too long. Truncating to length %d. Result: %s.", maxNameLength, volumeName))
-		}
-		if err := addConfigMapVolume(pod, namePath.Name, volumeName); err != nil {
-			return err
+		volumeName := getConfigMapVolumeName(namePath.Name)
+		if !addedVolumes[namePath.Name] {
+			if err := addConfigMapVolume(pod, namePath.Name, volumeName); err != nil {
+				return err
+			}
+			addedVolumes[namePath.Name] = true
 		}
 
 		if err := addConfigMapVolumeMount(pod, volumeName, namePath.Path); err != nil {
@@ -345,6 +350,26 @@ func addGeneralConfigMaps(pod *corev1.Pod, app *v1beta2.SparkApplication) error 
 		}
 	}
 	return nil
+}
+
+func getConfigMapVolumeName(configMapName string) string {
+	const volumeSuffix = "-vol"
+	preferredName := configMapName + volumeSuffix
+	if len(preferredName) <= maxNameLength && !strings.Contains(preferredName, ".") {
+		return preferredName
+	}
+
+	// ConfigMap names are DNS subdomains and may contain dots, while volume names
+	// must be DNS labels. Add a hash so sanitizing or truncating stays unique.
+	sanitizedName := strings.ReplaceAll(configMapName, ".", "-")
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(configMapName)))[:8]
+	hashedSuffix := "-" + hash + volumeSuffix
+	maxPrefixLength := maxNameLength - len(hashedSuffix)
+	if len(sanitizedName) > maxPrefixLength {
+		sanitizedName = sanitizedName[:maxPrefixLength]
+	}
+	sanitizedName = strings.TrimRight(sanitizedName, "-")
+	return sanitizedName + hashedSuffix
 }
 
 func addPrometheusConfig(pod *corev1.Pod, app *v1beta2.SparkApplication) error {
@@ -362,7 +387,7 @@ func addPrometheusConfig(pod *corev1.Pod, app *v1beta2.SparkApplication) error {
 	}
 
 	name := util.GetPrometheusConfigMapName(app)
-	volumeName := name + "-vol"
+	volumeName := getConfigMapVolumeName(name)
 	mountPath := common.PrometheusConfigMapMountPath
 	promPort := common.DefaultPrometheusJavaAgentPort
 	if app.Spec.Monitoring.Prometheus.Port != nil {
@@ -626,6 +651,8 @@ func addGPU(pod *corev1.Pod, app *v1beta2.SparkApplication) error {
 	if gpu == nil {
 		return nil
 	}
+
+	logger := log.FromContext(context.TODO())
 	if gpu.Name == "" {
 		logger.V(1).Info(fmt.Sprintf("Please specify GPU resource name, such as: nvidia.com/gpu, amd.com/gpu etc. Current gpu spec: %+v", gpu))
 		return nil

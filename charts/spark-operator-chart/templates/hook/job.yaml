@@ -28,6 +28,16 @@ metadata:
     helm.sh/hook-weight: "4"
 spec:
   template:
+    metadata:
+      labels:
+        {{- include "spark-operator.hook.labels" . | nindent 8 }}
+        {{- with .Values.hook.labels }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.hook.annotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       containers:
       - name: spark-operator-hook
@@ -38,15 +48,13 @@ spec:
         args:
         - apply
         - --server-side
+        - --force-conflicts
         - -f
         - /etc/spark-operator/crds
+        {{- with .Values.hook.resources }}
         resources:
-          requests:
-            cpu: 100m
-            memory: 64Mi
-          limits:
-            cpu: 100m
-            memory: 64Mi
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         securityContext:
           readOnlyRootFilesystem: true
           privileged: false
@@ -56,6 +64,18 @@ spec:
             - ALL
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hook.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hook.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hook.tolerations }}
+      tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "spark-operator.hook.serviceAccount.name" . }}
